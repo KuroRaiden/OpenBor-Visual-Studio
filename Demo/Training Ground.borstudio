@@ -1,0 +1,512 @@
+{
+  "version": 1,
+  "project": {
+    "title": "Training Ground",
+    "characters": [
+      {
+        "id": "goku",
+        "title": "Goku",
+        "type": "player",
+        "health": 100,
+        "speed": 1.8,
+        "animations": [
+          {
+            "name": "attack1",
+            "loop": false,
+            "frames": [
+              {
+                "image": "Training Ground.assets/060_18_right_00.png",
+                "ticks": 9,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_18_right_01.png",
+                "ticks": 9,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_18_right_02.png",
+                "ticks": 9,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_18_right_03.png",
+                "ticks": 9,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_18_right_04.png",
+                "ticks": 10,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_18_right_05.png",
+                "ticks": 9,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_18_right_06.png",
+                "ticks": 12,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              }
+            ],
+            "projectile": {
+              "enabled": true,
+              "frame": 4,
+              "model": "ki_blast",
+              "x": 17,
+              "z": 0,
+              "altitude": 14,
+              "velocityX": 2.5
+            },
+            "item": {
+              "enabled": true,
+              "frame": 5,
+              "model": "energy_capsule",
+              "x": -13,
+              "z": 5,
+              "altitude": 7
+            }
+          },
+          {
+            "name": "idle",
+            "loop": true,
+            "frames": [
+              {
+                "image": "Training Ground.assets/060_00_right_00.png",
+                "ticks": 20,
+                "originX": 0,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 0,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_00_right_01.png",
+                "ticks": 20,
+                "originX": 0,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 0,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              }
+            ]
+          },
+          {
+            "name": "walk",
+            "loop": true,
+            "frames": [
+              {
+                "image": "Training Ground.assets/060_01_right_00.png",
+                "ticks": 9,
+                "originX": 0,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 0,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_01_right_01.png",
+                "ticks": 9,
+                "originX": 0,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 0,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_01_right_02.png",
+                "ticks": 9,
+                "originX": 0,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 0,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/060_01_right_03.png",
+                "ticks": 9,
+                "originX": 0,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 0,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "piccolo",
+        "title": "Piccolo",
+        "type": "enemy",
+        "health": 42,
+        "speed": 1.3,
+        "animations": [
+          {
+            "name": "idle",
+            "loop": true,
+            "frames": [
+              {
+                "image": "Training Ground.assets/103_00_right_00.png",
+                "ticks": 22,
+                "originX": 0,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 0,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/103_00_right_01.png",
+                "ticks": 22,
+                "originX": 0,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 0,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              }
+            ]
+          },
+          {
+            "name": "walk",
+            "loop": true,
+            "frames": [
+              {
+                "image": "Training Ground.assets/103_01_right_00.png",
+                "ticks": 10,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/103_01_right_01.png",
+                "ticks": 10,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/103_01_right_02.png",
+                "ticks": 10,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/103_01_right_03.png",
+                "ticks": 10,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              }
+            ]
+          },
+          {
+            "name": "attack1",
+            "loop": false,
+            "frames": [
+              {
+                "image": "Training Ground.assets/103_06_right_00.png",
+                "ticks": 10,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/103_06_right_01.png",
+                "ticks": 8,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                },
+                "attack": {
+                  "enabled": true,
+                  "x": 18,
+                  "y": 8,
+                  "width": 13,
+                  "height": 15,
+                  "depth": 9,
+                  "damage": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/103_06_right_02.png",
+                "ticks": 10,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              },
+              {
+                "image": "Training Ground.assets/103_06_right_03.png",
+                "ticks": 13,
+                "originX": 8,
+                "originY": 24,
+                "body": {
+                  "enabled": true,
+                  "x": 2,
+                  "y": 3,
+                  "width": 12,
+                  "height": 21,
+                  "depth": 8
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "ki_blast",
+        "title": "Ki Blast",
+        "type": "projectile",
+        "animations": [
+          {
+            "name": "idle",
+            "loop": true,
+            "frames": [
+              {
+                "image": "Training Ground.assets/ki_blast.png",
+                "originX": 16,
+                "originY": 7,
+                "ticks": 8,
+                "attack": {
+                  "enabled": true,
+                  "x": 8,
+                  "y": 1,
+                  "width": 14,
+                  "height": 12,
+                  "depth": 10,
+                  "damage": 14
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "energy_capsule",
+        "title": "Energy Capsule",
+        "type": "item",
+        "health": 12,
+        "animations": [
+          {
+            "name": "idle",
+            "loop": true,
+            "frames": [
+              {
+                "image": "Training Ground.assets/energy_capsule.png",
+                "originX": 6,
+                "originY": 15,
+                "ticks": 15
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "stages": [
+      {
+        "title": "Canyon Approach",
+        "background": "Training Ground.assets/Canyon Sky.png",
+        "panels": [
+          "Training Ground.assets/Canyon Panel 1.png",
+          "Training Ground.assets/Canyon Panel 2.png",
+          "Training Ground.assets/Canyon Panel 3.png"
+        ],
+        "laneTop": 175,
+        "laneBottom": 221,
+        "playerX": 72,
+        "playerZ": 203,
+        "spawns": [
+          {
+            "model": "piccolo",
+            "at": 0,
+            "x": 240,
+            "z": 196
+          },
+          {
+            "model": "energy_capsule",
+            "at": 60,
+            "x": 270,
+            "z": 210,
+            "altitude": 8
+          },
+          {
+            "model": "piccolo",
+            "at": 360,
+            "x": 264,
+            "z": 198,
+            "item": "energy_capsule"
+          },
+          {
+            "model": "piccolo",
+            "at": 690,
+            "x": 289,
+            "z": 196,
+            "boss": true
+          }
+        ],
+        "waves": [
+          {
+            "at": 335,
+            "wait": true
+          },
+          {
+            "at": 660,
+            "wait": true
+          }
+        ]
+      }
+    ]
+  }
+}
