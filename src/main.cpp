@@ -150,18 +150,22 @@ fs::path executableDirectory() {
     return fs::path(path).parent_path();
 }
 
-int validate(const fs::path& file, const fs::path& output) {
+int validate(const fs::path& file, const fs::path& output, bool playable, bool native = false) {
     const auto report = output / "verification.txt";
     fs::create_directories(output);
     try {
         studio::Images images;
         studio::Project original;
-        if (fs::is_directory(file)) original.characters.push_back(studio::importSpriteFolder(file,"right",images));
+        if (native) {
+            const auto folder = fs::is_directory(file) ? file : studio::unpackModule(file,output);
+            int skipped = 0;
+            original = studio::importModule(folder,images,skipped);
+        } else if (fs::is_directory(file)) original.characters.push_back(studio::importSpriteFolder(file,"right",images));
         else original = studio::openProject(file);
         const auto portable = output/"Roundtrip.borstudio";
         studio::saveProject(original,portable);
         const auto roundtrip = studio::openProject(portable);
-        const auto exported = studio::exportProject(roundtrip,output,images);
+        const auto exported = studio::exportProject(roundtrip,output,images,playable);
         if (roundtrip.characters.size() != original.characters.size() ||
             roundtrip.stages.size() != original.stages.size()) {
             throw std::runtime_error("Project roundtrip lost models or stages.");
@@ -179,7 +183,9 @@ int validate(const fs::path& file, const fs::path& output) {
 }
 
 int run(HINSTANCE instance, int show, const std::vector<std::wstring>& args) {
-    if (args.size() == 4 && args[1] == L"--verify") return validate(args[2],args[3]);
+    if (args.size() == 4 && args[1] == L"--verify-module") return validate(args[2],args[3],true,true);
+    if (args.size() == 4 && (args[1] == L"--verify" || args[1] == L"--verify-playable"))
+        return validate(args[2],args[3],args[1] == L"--verify-playable");
     const bool capturing = args.size() == 4 && args[1] == L"--capture";
     ImGui_ImplWin32_EnableDpiAwareness();
     const WNDCLASSEXW wc{sizeof(wc),CS_CLASSDC,windowProc,0,0,instance,
