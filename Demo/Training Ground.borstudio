@@ -113,14 +113,13 @@
                 }
               }
             ],
-            "projectile": {
+            "subEntity": {
               "enabled": true,
               "frame": 4,
               "model": "ki_blast",
               "x": 17,
               "z": 0,
-              "altitude": 14,
-              "velocityX": 2.5
+              "altitude": 14
             },
             "item": {
               "enabled": true,
@@ -409,6 +408,8 @@
         "id": "ki_blast",
         "title": "Ki Blast",
         "type": "projectile",
+        "entity": { "lifespan": 2, "gravity": 0 },
+        "extraHeader": "hostile enemy\ncandamage enemy obstacle",
         "animations": [
           {
             "name": "idle",
@@ -419,6 +420,7 @@
                 "originX": 16,
                 "originY": 7,
                 "ticks": 8,
+                "extraCommands": "    move 20",
                 "attack": {
                   "enabled": true,
                   "x": 8,

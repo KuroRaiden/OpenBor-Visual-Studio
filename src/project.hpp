@@ -39,14 +39,13 @@ struct SpawnCue {
     int frame = 0;
     std::string model;
     int x = 18, z = 0, altitude = 20;
-    float velocityX = 2.0f, velocityZ = 0.0f, velocityY = 0.0f;
 };
 
 struct Animation {
     std::string name = "idle";
     bool loop = true;
     std::vector<Frame> frames;
-    SpawnCue projectile, item;
+    SpawnCue subEntity, item;
     int meshClip = -1;
     std::string extraCommands;
 };
@@ -55,6 +54,7 @@ struct EntitySettings {
     int mp = -1, aggression = -1, score = -1;
     float jumpHeight = -1, lifespan = -1;
     int wall = -1, gravity = -1;
+    float jumpSpeed = -1, runningJumpHeight = -1, runningJumpDistance = -1;
 };
 
 struct ColorSet {
@@ -118,13 +118,34 @@ struct StagePanel {
     ScreenPoint offset;
 };
 
+struct StageTerrain {
+    bool pit = false;
+    int x = 100, z = 230, width = 64, depth = 16, altitude = 32, type = 0;
+    bool operator==(const StageTerrain&) const = default;
+};
+
+inline constexpr int stageTerrainLimit = 99999;
+
+struct StageCamera {
+    int zoom = 100;
+    int offsetX = 0, offsetY = 0;
+    bool followAltitude = false;
+    bool nativeZoom = false;
+    bool operator==(const StageCamera&) const = default;
+};
+
+inline constexpr int cameraZoomMin = 50, cameraZoomMax = 200, cameraOffsetLimit = 4096;
+
 struct Stage {
     std::string title = "Untitled stage";
     fs::path background;
     ScreenPoint backgroundOffset;
     bool repeatBackgroundX = true, repeatBackgroundY = true;
     std::vector<StagePanel> panels;
+    std::vector<StageTerrain> terrain;
+    StageCamera camera;
     int laneTop = 160, laneBottom = 230;
+    int backgroundDepth = -1;
     int playerX = 72, playerZ = 195;
     std::vector<StageSpawn> spawns;
     std::vector<Wave> waves;
@@ -232,10 +253,11 @@ std::string animationId(std::string_view name);
 std::string lower(std::string value);
 const Character* findCharacter(const Project& project, const std::string& id);
 const Frame* previewFrame(const Character* character);
+ImageSize stageVideoSize(const Project& project);
 bool hasFrames(const Character& character);
 Frame makeFrame(const fs::path& path, Images& images);
 
-Project openProject(const fs::path& file);
+Project openProject(const fs::path& file, bool verifyAssets = false);
 Project importModule(const fs::path& folder, Images& images, int& skipped);
 fs::path unpackModule(const fs::path& pak, const fs::path& parent);
 std::string nativeFileText(const Project& project, const std::string& name);
@@ -251,6 +273,11 @@ std::string moduleLevelsText(const ModuleSettings& module);
 std::string modelsConfigurationText(const Project& project);
 std::string levelsConfigurationText(const Project& project);
 Screens loadScreenTemplate(const fs::path& folder);
-fs::path exportProject(const Project& project, const fs::path& parent, Images& images, bool playable = false);
+enum class ExportDestination { newFolder, existingPak, existingData };
+struct StagePlaytest { size_t stage; std::string player; };
+fs::path exportProject(const Project& project, const fs::path& target, Images& images, bool playable = false,
+                       ExportDestination destination = ExportDestination::newFolder,
+                       const StagePlaytest* playtest = nullptr);
+fs::path existingExportData(const fs::path& target);
 void verifyProject(const Project& project);
 }

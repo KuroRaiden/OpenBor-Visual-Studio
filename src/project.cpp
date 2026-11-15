@@ -22,14 +22,16 @@ using nlohmann::json;
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Box, enabled, x, y, width, height, depth, damage)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(DrawEffects, enabled, flipX, flipY, embeddedAlpha, scaleX, scaleY, rotation, blend, mask)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Frame, image, sound, ticks, originX, originY, body, attack, effects, extraCommands)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SpawnCue, enabled, frame, model, x, z, altitude, velocityX, velocityZ, velocityY)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Animation, name, loop, frames, projectile, item, meshClip, extraCommands)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(EntitySettings, mp, aggression, score, jumpHeight, lifespan, wall, gravity)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SpawnCue, enabled, frame, model, x, z, altitude)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Animation, name, loop, frames, subEntity, item, meshClip, extraCommands)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(EntitySettings, mp, aggression, score, jumpHeight, lifespan, wall, gravity, jumpSpeed, runningJumpHeight, runningJumpDistance)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ColorSet, name, colors)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(MeshSettings, file, up, forward, scale, pitch, yaw, roll, planar)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Character, id, title, type, health, speed, animations, entity, icon, deathSound, sourcePalette, colorSets, extraHeader, mesh, nativeFile)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StageSpawn, model, at, x, z, altitude, flip, boss, item, health, mp, palette)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Wave, at, wait)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StageTerrain, pit, x, z, width, depth, altitude, type)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StageCamera, zoom, offsetX, offsetY, followAltitude, nativeZoom)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ScreenPoint, x, y)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Gauge, width, height, ratio, vertical, noBorder, border, shadow, fill, backfill)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(HudPlayer, life, mp, icon, score, enemy)
@@ -49,7 +51,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Screens, backgrounds, fonts, sce
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ModuleSettings, hud, select, screens, maxPlayers, modelsHeader, levelsHeader, videoHeader, levelSetCommands)
 
 void exportModuleArtwork(const Project& project, const fs::path& root, Images& images, bool playable);
-void writePlayablePak(const fs::path& root, const std::string& title);
+fs::path writePlayablePak(const fs::path& root, const std::string& title);
 
 void to_json(json& value, const StagePanel& panel) {
     if (panel.offset.x || panel.offset.y) value = {{"image",panel.image},{"offset",panel.offset}};
@@ -64,7 +66,7 @@ void from_json(const json& value, StagePanel& panel) {
     }
 }
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Stage, title, background, backgroundOffset, repeatBackgroundX, repeatBackgroundY, panels, laneTop, laneBottom, playerX, playerZ, spawns, waves, extraHeader, music, musicOffset, before, after, nativeFile, nativeBeforeFile, nativeAfterFile)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Stage, title, background, backgroundOffset, repeatBackgroundX, repeatBackgroundY, panels, terrain, camera, laneTop, laneBottom, backgroundDepth, playerX, playerZ, spawns, waves, extraHeader, music, musicOffset, before, after, nativeFile, nativeBeforeFile, nativeAfterFile)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Project, title, characters, stages, module, nativeFiles, nativeNames, nativeEdits, nativeBaseline)
 
 namespace {
@@ -209,8 +211,64 @@ void validateCue(const SpawnCue& cue, const Animation& animation, const Project&
             "Set an existing trigger frame for " + animation.name + ".");
     const Character* model = findCharacter(project, cue.model);
     require(model && hasFrames(*model), "Select a model with frames for the cue in " + animation.name + ".");
-    require(std::isfinite(cue.velocityX) && std::isfinite(cue.velocityY) && std::isfinite(cue.velocityZ),
-            "Spawn velocity must be finite.");
+}
+
+void migrateSpawnSettings(json& animation) {
+    if (auto old = animation.find("projectile"); old != animation.end()) {
+        if (!animation.contains("subEntity")) animation["subEntity"] = old->get<SpawnCue>();
+        animation.erase("projectile");
+        if (auto item = animation.find("item"); item != animation.end()) *item = item->get<SpawnCue>();
+    }
+}
+
+constexpr std::string_view itemCueMarker = "# OpenBOR Studio item cue ";
+
+bool readItemCue(std::string_view line, SpawnCue& cue) {
+    const auto start = line.find_first_not_of(" \t");
+    if (start == line.npos || !line.substr(start).starts_with(itemCueMarker)) return false;
+    std::istringstream tokens{std::string(line.substr(start+itemCueMarker.size()))};
+    cue.enabled = bool(tokens >> cue.model >> cue.frame >> cue.x >> cue.z >> cue.altitude);
+    return cue.enabled;
+}
+
+bool legacySpawnCommand(std::string_view command) {
+    return command == "custknife" || command == "throwframe" ||
+           command.starts_with("projectile_position_") || command.starts_with("projectile_velocity_");
+}
+
+void writeSpawnCues(std::ostream& out, const Animation& animation) {
+    const auto& primary = animation.subEntity.enabled ? animation.subEntity : animation.item;
+    if (!primary.enabled) return;
+    require(validToken(primary.model),"Select a Sub Entity model for " + animation.name + ".");
+    out << "    subentity " << primary.model << "\n    spawnframe "
+        << primary.frame << ' ' << primary.x << ' ' << primary.z << ' ' << primary.altitude << " 0\n";
+    if (!animation.subEntity.enabled || !animation.item.enabled) return;
+
+    // The native animation can reference one model. Keep the separate item cue via the animation script.
+    const auto& item = animation.item;
+    require(validToken(item.model),"Select an item model for " + animation.name + ".");
+    out << "    " << itemCueMarker << item.model << ' ' << item.frame << ' ' << item.x << ' '
+        << item.z << ' ' << item.altitude << "\n"
+        << "    @script\n"
+        << "    if (frame == " << item.frame << ") {\n"
+        << "        void studioParent = getlocalvar(\"self\");\n"
+        << "        int studioFacing = getentityproperty(studioParent, \"direction\");\n"
+        << "        float studioX = getentityproperty(studioParent, \"x\") + (2 * studioFacing - 1) * (" << item.x << ");\n"
+        << "        float studioZ = getentityproperty(studioParent, \"z\") + (" << item.z << ");\n"
+        << "        float studioY = getentityproperty(studioParent, \"a\") + (" << item.altitude << ");\n"
+        << "        clearspawnentry();\n"
+        << "        setspawnentry(\"name\", \"" << item.model << "\");\n"
+        << "        setspawnentry(\"flip\", studioFacing);\n"
+        << "        float studioScrollX = 0;\n"
+        << "        if (openborvariant(\"in_level\")) studioScrollX = openborvariant(\"xpos\");\n"
+        << "        setspawnentry(\"coords\", studioX - studioScrollX, studioZ, studioY);\n"
+        << "        void studioItem = spawn();\n"
+        << "        if (studioItem) {\n"
+        << "            changeentityproperty(studioItem, \"position\", studioX, studioZ, studioY);\n"
+        << "            changeentityproperty(studioItem, \"parent\", studioParent);\n"
+        << "        }\n"
+        << "    }\n"
+        << "    @end_script\n";
 }
 
 int freeSpecial(const std::string& name) {
@@ -315,11 +373,20 @@ Frame makeFrame(const fs::path& path, Images& images) {
     return frame;
 }
 
-Project openProject(const fs::path& file) {
+Project openProject(const fs::path& file, bool verifyAssets) {
     const auto root = fs::absolute(file).parent_path();
-    const json data = json::parse(readText(file));
+    auto data = json::parse(readText(file));
     require(data.value("version", 0) == 1, "Unsupported OpenBOR Studio project version.");
+    for (auto& model : data.at("project")["characters"])
+        for (auto& animation : model["animations"]) migrateSpawnSettings(animation);
     auto project = data.at("project").get<Project>();
+    for (const auto& model : project.characters) {
+        const auto baseline = project.nativeBaseline.find(model.nativeFile);
+        if (baseline == project.nativeBaseline.end()) continue;
+        auto original = json::parse(baseline->second);
+        for (auto& animation : original["animations"]) migrateSpawnSettings(animation);
+        baseline->second = original.dump();
+    }
     for (const auto& [name,asset] : project.nativeFiles) (void)nativeDataPath(name);
     for (const auto& [name,original] : project.nativeNames) {
         require(nativeReference(original) == name && project.nativeFiles.contains(name),"Invalid native module path.");
@@ -331,8 +398,48 @@ Project openProject(const fs::path& file) {
         require(relative.begin() != relative.end() && *relative.begin() != L"..",
                 "Project asset path points outside its directory.");
         asset = root / relative;
+        if (verifyAssets) require(fs::is_regular_file(asset),"Missing recovery asset: "+utf8(relative));
     });
+    for (size_t i = 0; i < project.stages.size(); ++i) {
+        auto& stage = project.stages[i];
+        if (!stage.nativeFile.empty() && project.nativeFiles.contains(stage.nativeFile) &&
+            !data.at("project").at("stages")[i].contains("camera")) {
+            if (fs::is_regular_file(project.nativeFiles.at(stage.nativeFile))) {
+                stage.camera = readStageCamera(readText(project.nativeFiles.at(stage.nativeFile)));
+                if (auto baseline = project.nativeBaseline.find(stage.nativeFile); baseline != project.nativeBaseline.end()) {
+                    auto baselineData = json::parse(baseline->second);
+                    baselineData["camera"] = stage.camera;
+                    baseline->second = baselineData.dump();
+                }
+            }
+        }
+    }
     return project;
+}
+
+ImageSize stageVideoSize(const Project& project) {
+    constexpr std::array<ImageSize,7> modes{{{320,240},{480,272},{640,480},{720,480},
+                                             {800,480},{800,600},{960,540}}};
+    auto size = modes.front();
+    const auto apply = [&](const std::string& source) {
+        std::istringstream input(source), tokens;
+        for (std::string line; std::getline(input,line);) {
+            const auto command = nativeCommand(line,tokens);
+            if (command != "video" && command != "videomode") continue;
+            int width, height;
+            char separator;
+            if (!(tokens >> width)) continue;
+            if (tokens >> separator >> height && (separator == 'x' || separator == 'X')) {
+                if (width >= 4 && width <= 8192 && height >= 4 && height <= 8192) size = {width & ~3,height};
+            } else if (width >= 0 && width < int(modes.size())) size = modes[size_t(width)];
+        }
+    };
+    if (project.nativeFiles.contains("data/video.txt")) {
+        try { apply(nativeFileText(project,"data/video.txt")); }
+        catch (const std::exception&) {}
+    }
+    if (!project.nativeEdits.contains("data/video.txt")) apply(project.module.videoHeader);
+    return size;
 }
 
 void saveProject(const Project& project, const fs::path& file) {
@@ -415,7 +522,7 @@ void renameCharacter(Project& project, size_t index, const std::string& proposed
     };
     for (auto& model : project.characters) {
         for (auto& animation : model.animations) {
-            rename(animation.projectile.model);
+            rename(animation.subEntity.model);
             rename(animation.item.model);
         }
     }
@@ -530,12 +637,32 @@ Character importCharacterFile(const fs::path& file, Images& images, int& skipped
     std::istringstream input(readText(file));
     std::string line;
     skipped = 0;
+    bool inlineScript = false;
+    bool nextItemScript = false;
     while (std::getline(input, line)) {
+        SpawnCue item;
+        if (!inlineScript && animation && readItemCue(line,item)) {
+            if (!animation->subEntity.enabled && animation->item.enabled)
+                animation->subEntity = std::move(animation->item);
+            animation->item = std::move(item);
+            nextItemScript = true;
+            continue;
+        }
         line.resize(std::min(line.find('#'), line.size()));
         std::istringstream tokens(line);
         std::string command, value;
         if (!(tokens >> command)) continue;
         command = lower(command);
+        if (command == "@script" || (command == "animationscript" && line.find("@script") != line.npos)) {
+            inlineScript = true;
+            if (!nextItemScript) ++skipped;
+            nextItemScript = false;
+            continue;
+        }
+        if (inlineScript) {
+            if (command == "@end_script") inlineScript = false;
+            continue;
+        }
         if (command == "name") {
             tokens >> character.title;
             character.id = modelToken(character.title);
@@ -554,8 +681,10 @@ Character importCharacterFile(const fs::path& file, Images& images, int& skipped
             tokens >> character.entity.aggression;
         } else if (command == "score") {
             tokens >> character.entity.score;
-        } else if (command == "jumpheight") {
+        } else if (command == "jumpheight" || command == "jump_height") {
             tokens >> character.entity.jumpHeight;
+        } else if (command == "jumpspeed" || command == "jumpspeedf" || command == "jump_speed") {
+            if (tokens >> character.entity.jumpSpeed && command == "jumpspeed") character.entity.jumpSpeed /= 10;
         } else if (command == "lifespan") {
             tokens >> character.entity.lifespan;
         } else if (command == "subject_to_wall") {
@@ -577,6 +706,7 @@ Character importCharacterFile(const fs::path& file, Images& images, int& skipped
         } else if (command == "anim") {
             if (!(tokens >> value)) throw std::runtime_error("Animation is missing its name.");
             animation = &character.animations.emplace_back();
+            nextItemScript = false;
             animation->name = animationId(value);
             animation->loop = false;
             properties = Frame{};
@@ -641,21 +771,19 @@ Character importCharacterFile(const fs::path& file, Images& images, int& skipped
                 else tokens >> box.damage;
             }
         } else if (animation && command == "custknife") {
-            tokens >> animation->projectile.model;
-            animation->projectile.model = modelToken(animation->projectile.model);
+            tokens >> value;
+            animation->subEntity.model = modelToken(value);
         } else if (animation && command == "throwframe") {
-            auto& cue = animation->projectile;
+            auto& cue = animation->subEntity;
             cue.enabled = bool(tokens >> cue.frame);
-            tokens >> cue.altitude;
-        } else if (animation && command == "projectile_position_x") tokens >> animation->projectile.x;
-        else if (animation && command == "projectile_position_y") tokens >> animation->projectile.altitude;
-        else if (animation && command == "projectile_position_z") tokens >> animation->projectile.z;
-        else if (animation && command == "projectile_velocity_x") tokens >> animation->projectile.velocityX;
-        else if (animation && command == "projectile_velocity_y") tokens >> animation->projectile.velocityY;
-        else if (animation && command == "projectile_velocity_z") tokens >> animation->projectile.velocityZ;
+            int altitude = 0;
+            if (tokens >> altitude) cue.altitude = altitude == -1 ? 0 : altitude;
+        } else if (animation && command == "projectile_position_x") tokens >> animation->subEntity.x;
+        else if (animation && command == "projectile_position_y") tokens >> animation->subEntity.altitude;
+        else if (animation && command == "projectile_position_z") tokens >> animation->subEntity.z;
         else if (animation && (command == "subentity" || command == "custentity")) {
-            tokens >> animation->item.model;
-            animation->item.model = modelToken(animation->item.model);
+            tokens >> value;
+            animation->item.model = modelToken(value);
         } else if (animation && command == "spawnframe") {
             auto& cue = animation->item;
             int placement = 0;
@@ -666,6 +794,12 @@ Character importCharacterFile(const fs::path& file, Images& images, int& skipped
             }
         } else {
             ++skipped;
+        }
+    }
+    for (auto& clip : character.animations) {
+        if (!clip.subEntity.enabled && clip.item.enabled) {
+            clip.subEntity = std::move(clip.item);
+            clip.item = {};
         }
     }
     require(hasFrames(character), "No readable animation frames were found in that model.");
@@ -684,6 +818,7 @@ std::string modelText(const Character& model, const GlbModel* mesh, std::string 
     if (entity.aggression >= 0) out << "aggression " << entity.aggression << '\n';
     if (entity.score >= 0) out << "score " << entity.score << '\n';
     if (entity.jumpHeight >= 0) out << "jumpheight " << entity.jumpHeight << '\n';
+    if (entity.jumpSpeed >= 0) out << "jumpspeedf " << entity.jumpSpeed << '\n';
     if (entity.lifespan >= 0) out << "lifespan " << entity.lifespan << '\n';
     if (entity.wall >= 0) out << "subject_to_wall " << entity.wall << '\n';
     if (entity.gravity >= 0) out << "subject_to_gravity " << entity.gravity << '\n';
@@ -702,6 +837,8 @@ std::string modelText(const Character& model, const GlbModel* mesh, std::string 
     for (size_t i=1; i<model.colorSets.size(); ++i)
         out << "alternatepal " << assetRoot << counterName("palette_",i,".act") << '\n';
     if (!model.extraHeader.empty()) out << model.extraHeader << '\n';
+    if (entity.runningJumpHeight >= 0) out << "run.jump.y " << entity.runningJumpHeight << '\n';
+    if (entity.runningJumpDistance >= 0) out << "run.jump.x " << entity.runningJumpDistance << '\n';
     bool previousEffect = false;
     for (size_t a = 0; a < model.animations.size(); ++a) {
         const auto& animation = model.animations[a];
@@ -711,22 +848,7 @@ std::string modelText(const Character& model, const GlbModel* mesh, std::string 
             require(mesh && size_t(animation.meshClip) < mesh->clips().size(),"Choose an existing GLB clip for "+animation.name+".");
             out << "    meshclip " << mesh->clips()[size_t(animation.meshClip)].exportName << '\n';
         }
-        const auto& p = animation.projectile;
-        if (p.enabled) {
-            out << "    custknife " << p.model << "\n    throwframe " << p.frame
-                << ' ' << (p.altitude == 0 ? -1 : p.altitude)
-                << "\n    projectile_position_x " << p.x
-                << "\n    projectile_position_z " << p.z
-                << "\n    projectile_position_y " << p.altitude
-                << "\n    projectile_velocity_x " << p.velocityX
-                << "\n    projectile_velocity_z " << p.velocityZ
-                << "\n    projectile_velocity_y " << p.velocityY << '\n';
-        }
-        const auto& item = animation.item;
-        if (item.enabled) {
-            out << "    subentity " << item.model << "\n    spawnframe "
-                << item.frame << ' ' << item.x << ' ' << item.z << ' ' << item.altitude << " 0\n";
-        }
+        writeSpawnCues(out,animation);
         if (!animation.extraCommands.empty()) out << animation.extraCommands << '\n';
         for (size_t f = 0; f < animation.frames.size(); ++f) {
             const auto& frame = animation.frames[f];
@@ -797,8 +919,148 @@ std::vector<ImageSize> panelSizes(const Stage& stage, const Images& images) {
     return sizes;
 }
 
+std::string stageTerrainText(const std::vector<StageTerrain>& terrain) {
+    std::ostringstream out;
+    for (const auto& shape : terrain) {
+        out << (shape.pit ? "hole " : "wall ") << shape.x << ' ' << shape.z << " 0 0 "
+            << shape.width << ' ' << shape.width << ' ' << shape.depth << ' '
+            << shape.altitude << ' ' << shape.type << '\n';
+    }
+    return out.str();
+}
+
+std::string stageDepthText(const Stage& stage) {
+    const int backgroundDepth = stage.backgroundDepth > 0 ? stage.backgroundDepth : stage.laneBottom;
+    return "z "+std::to_string(stage.laneTop)+' '+std::to_string(stage.laneBottom)+' '+std::to_string(backgroundDepth)+'\n';
+}
+
+std::string stagePlayerStartText(const Stage& stage) {
+    return "spawn1 "+std::to_string(stage.playerX)+' '+std::to_string(stage.playerZ-stage.laneTop)+" 0\n";
+}
+
+// The generated section is identified so an exported data folder can be reopened and edited.
+constexpr std::string_view cameraZoomMarker = "# studio_camera_zoom ";
+constexpr std::string_view cameraHookMarker = "# studio_camera_previous ";
+
+std::string applyStageCamera(const std::string& source, const StageCamera& camera,
+                             bool updateZoom, bool updateOffset, bool updateFollow,
+                             const std::string& scriptPath, std::string* scriptBody) {
+    std::istringstream input(source), tokens;
+    std::ostringstream remaining, header;
+    bool inlineScript = false, generated = false;
+    std::string previousSource;
+    const auto keepHook = updateZoom && camera.zoom != 100 && !camera.nativeZoom;
+    for (std::string line; std::getline(input,line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (updateZoom && !inlineScript && line.starts_with(cameraZoomMarker)) {
+            generated = true;
+            continue;
+        }
+        if (generated) {
+            if (line.starts_with(cameraHookMarker)) {
+                previousSource = line.substr(cameraHookMarker.size());
+                if (!keepHook) remaining << previousSource << '\n';
+            }
+            if (line == "# studio_camera_end") generated = false;
+            continue;
+        }
+        if (!inlineScript) {
+            const auto command = nativeCommand(line,tokens);
+            if ((updateOffset && command == "cameraoffset") || (updateFollow && command == "cameratype") ||
+                (updateZoom && command == "camerazoom")) continue;
+            const bool startsScript = startsInlineScript(tokens);
+            if (keepHook && command == "updatedscript") {
+                require(!startsScript,"Choose OpenBOR3D camera mode or move the inline updatedscript to a file before enabling 2D camera zoom.");
+                std::string script;
+                if (tokens >> std::quoted(script)) {
+                    previousSource = line;
+                    continue;
+                }
+            }
+            inlineScript = startsScript;
+        }
+        if (inlineScript && line.find("@end_script") != std::string::npos) inlineScript = false;
+        remaining << line << '\n';
+    }
+    if (updateOffset && (camera.offsetX || camera.offsetY))
+        header << "cameraoffset " << camera.offsetX << ' ' << camera.offsetY << '\n';
+    if (updateFollow && camera.followAltitude) header << "cameratype 1\n";
+    if (!updateZoom || camera.zoom == 100) return header.str()+remaining.str();
+    if (camera.nativeZoom)
+        return header.str()+"camerazoom "+std::to_string(camera.zoom)+'\n'+remaining.str();
+
+    std::string previous;
+    nativeCommand(previousSource,tokens);
+    tokens >> std::quoted(previous);
+    header << cameraZoomMarker << camera.zoom << '\n';
+    if (!previous.empty()) header << cameraHookMarker << previousSource << '\n';
+    header << "updatedscript " << scriptPath << "\n# studio_camera_end\n";
+    if (!scriptBody) return header.str()+remaining.str();
+    std::ostringstream script;
+    script << R"(
+void main()
+{
+)";
+    if (!previous.empty()) {
+        script << R"(    void previous = getlocalvar("studio_camera_previous");
+    if (!previous) {
+        previous = allocscript("Studio camera previous updatedscript");
+        loadscript(previous,)" << std::quoted(previous) << R"();
+        compilescript(previous);
+        setlocalvar("studio_camera_previous",previous);
+    }
+    executescript(previous);
+)";
+    }
+    script << "    int zoom = " << camera.zoom << ";\n" << R"(
+    if (!openborvariant("in_level") || openborvariant("game_paused")) return;
+    int width = openborvariant("hResolution");
+    int height = openborvariant("vResolution");
+    int worldWidth = ((width * 100 / zoom + 3) / 4) * 4;
+    int worldHeight = height * 100 / zoom;
+    void world = getlocalvar("studio_camera_world");
+    if (world) {
+        if (getgfxproperty(world,"width") != worldWidth || getgfxproperty(world,"height") != worldHeight) {
+            free(world);
+            world = NULL();
+        }
+    }
+    if (!world) {
+        world = allocscreen(worldWidth,worldHeight);
+        setlocalvar("studio_camera_world",world);
+        if (!world) return;
+    }
+    clearscreen(world);
+    drawspriteq(world,0,openborconstant("MIN_INT"),9997,
+                (worldWidth-width)/2,worldHeight-height);
+    changedrawmethod(NULL(),"reset",1);
+    changedrawmethod(NULL(),"enabled",1);
+    changedrawmethod(NULL(),"scalex",(width*256+worldWidth-1)/worldWidth);
+    changedrawmethod(NULL(),"scaley",(height*256+worldHeight-1)/worldHeight);
+    drawscreen(world,0,0,9999);
+    changedrawmethod(NULL(),"reset",1);
+}
+
+void ondestroy()
+{
+    void world = getlocalvar("studio_camera_world");
+    if (world) free(world);
+    setlocalvar("studio_camera_world",NULL());
+)";
+    if (!previous.empty()) {
+        script << R"(    void previous = getlocalvar("studio_camera_previous");
+    if (previous) free(previous);
+    setlocalvar("studio_camera_previous",NULL());
+)";
+    }
+    script << "}\n";
+    *scriptBody = script.str();
+    return header.str()+remaining.str();
+}
+
 std::string stageTextWithLayout(const Stage& stage, size_t index, const StageArtLayout& layout,
-                                std::string art = {}, std::string music = {}) {
+                                std::string art = {}, std::string music = {},
+                                std::string cameraScript = {}, std::string* scriptBody = nullptr) {
     if (art.empty()) art = artPath(index);
     std::ostringstream out;
     out << "# " << modelToken(stage.title) << "\ndirection right\n";
@@ -820,7 +1082,8 @@ std::string stageTextWithLayout(const Stage& stage, size_t index, const StageArt
         for (int panel = 0; panel < layout.panelCount; ++panel) out << char('a'+panel);
         out << '\n';
     }
-    out << "spawn1 " << stage.playerX << ' ' << (stage.playerZ - stage.laneTop) << " 0\n";
+    out << stagePlayerStartText(stage);
+    out << stageTerrainText(stage.terrain);
     if (!stage.extraHeader.empty()) out << stage.extraHeader << '\n';
     struct Event { int at; const StageSpawn* spawn; };
     std::vector<Event> events;
@@ -841,6 +1104,10 @@ std::string stageTextWithLayout(const Stage& stage, size_t index, const StageArt
         } else out << "wait\n";
         out << "at " << event.at << '\n';
     }
+    const auto& camera = stage.camera;
+    if (camera != StageCamera{})
+        return applyStageCamera(out.str(),camera,camera.zoom != 100,camera.offsetX || camera.offsetY,camera.followAltitude,
+            cameraScript.empty() ? "data/scripts/"+counterName("studio_camera_",index+1,".c") : cameraScript,scriptBody);
     return out.str();
 }
 
@@ -932,7 +1199,7 @@ void verifyProject(const Project& project) {
                     " duplicates the OpenBOR ID \"" + id + "\".");
             require(animation.meshClip == -1 || (animation.meshClip >= 0 && !model.mesh.file.empty()),
                     "Choose a GLB for the clip mapped to "+animation.name+" in "+model.id+".");
-            validateCue(animation.projectile, animation, project);
+            validateCue(animation.subEntity, animation, project);
             validateCue(animation.item, animation, project);
             for (const auto& frame : animation.frames) {
                 require(frame.ticks > 0,"An animation frame in "+model.id+" needs a positive delay.");
@@ -949,6 +1216,16 @@ void verifyProject(const Project& project) {
         require(names.contains("idle"), "Add an idle animation with frames to " + model.id + ".");
     }
     for (const auto& stage : project.stages) {
+        require(stage.camera.zoom >= cameraZoomMin && stage.camera.zoom <= cameraZoomMax,
+                "Choose a camera zoom between 50% and 200% for "+stage.title+".");
+        for (const auto& shape : stage.terrain) {
+            const auto inRange = [](int value) { return value >= -stageTerrainLimit && value <= stageTerrainLimit; };
+            require(inRange(shape.x) && inRange(shape.z) && inRange(shape.type) &&
+                    shape.width > 0 && shape.width <= stageTerrainLimit &&
+                    shape.depth > 0 && shape.depth <= stageTerrainLimit &&
+                    shape.altitude >= (shape.pit ? 0 : 1) && shape.altitude <= stageTerrainLimit,
+                    "Invalid platform or pit geometry in "+stage.title+".");
+        }
         if (native && !stage.nativeFile.empty()) continue;
         require(!stage.panels.empty(), "Add a panel to " + stage.title + " before exporting.");
         require(stage.panels.size() <= 26, "A stage can have at most 26 panel slots.");
@@ -987,7 +1264,7 @@ std::string modelsConfigurationText(const Project& project) {
         for (const auto& animation : model.animations) {
             specials = std::max(specials,freeSpecial(animationId(animation.name)));
             if (animation.frames.empty()) continue;
-            if (animation.projectile.enabled) preload.insert(animation.projectile.model);
+            if (animation.subEntity.enabled) preload.insert(animation.subEntity.model);
             if (animation.item.enabled) preload.insert(animation.item.model);
         }
     }
@@ -1007,7 +1284,7 @@ std::string levelsConfigurationText(const Project& project) {
     }
     for (size_t i = 0; i < project.stages.size(); ++i) {
         const auto& stage = project.stages[i];
-        levels << "z " << stage.laneTop << ' ' << stage.laneBottom << ' ' << stage.laneBottom << "\n";
+        levels << stageDepthText(stage);
         if (!stage.before.file.empty()) levels << "scene data/scenes/" << stageSceneName(i,false) << ".txt\n";
         levels << "file " << levelPath(i) << "\n";
         if (!stage.after.file.empty()) levels << "scene data/scenes/" << stageSceneName(i,true) << ".txt\n";
@@ -1041,15 +1318,64 @@ void eraseFields(json& value, std::initializer_list<const char*> keys) {
     for (const auto key : keys) value.erase(key);
 }
 
-json modelWithoutSound(json value) {
+json modelWithoutSoundJumpOrSpawns(json value) {
     eraseFields(value,{"deathSound","title"});
-    for (auto& clip : value["animations"])
+    eraseFields(value["entity"],{"jumpHeight","jumpSpeed","runningJumpHeight","runningJumpDistance"});
+    for (auto& clip : value["animations"]) {
+        eraseFields(clip,{"subEntity","item"});
         for (auto& frame : clip["frames"]) frame.erase("sound");
+    }
     return value;
 }
 
-json stageWithoutMedia(json value) {
-    eraseFields(value,{"title","music","musicOffset","before","after"});
+bool spawnCuesChanged(const json& current, const json& original) {
+    return current.at("subEntity") != original.at("subEntity") || current.at("item") != original.at("item");
+}
+
+std::string patchModelSpawns(const Project& project, const Character& model,
+                             const json& current, const json& original, const std::string& source) {
+    const auto& clips = current.at("animations");
+    const auto& baseline = original.at("animations");
+    std::istringstream input(source), tokens;
+    std::ostringstream out;
+    std::string line;
+    size_t clip = size_t(-1);
+    bool changed = false, script = false, generated = false;
+    while (std::getline(input,line)) {
+        const auto command = nativeCommand(line,tokens);
+        if (script || command == "@script" ||
+            (command == "animationscript" && line.find("@script") != line.npos)) {
+            script = line.find("@end_script") == line.npos;
+            if (!generated) out << line << '\n';
+            if (!script) generated = false;
+            continue;
+        }
+        if (command == "anim") {
+            ++clip;
+            changed = clip < clips.size() && spawnCuesChanged(clips[clip],baseline[clip]);
+            out << line << '\n';
+            if (changed) {
+                const auto& animation = model.animations[clip];
+                validateCue(animation.subEntity,animation,project);
+                validateCue(animation.item,animation,project);
+                writeSpawnCues(out,animation);
+            }
+            continue;
+        }
+        if (changed) {
+            SpawnCue item;
+            if (readItemCue(line,item)) { generated = true; continue; }
+            if (command == "subentity" || command == "custentity" || command == "spawnframe" ||
+                legacySpawnCommand(command)) continue;
+        }
+        out << line << '\n';
+    }
+    return out.str();
+}
+
+json stageWithoutMediaOrTerrain(json value) {
+    eraseFields(value,{"title","music","musicOffset","before","after","terrain","camera","backgroundDepth",
+                       "laneTop","laneBottom","playerZ"});
     return value;
 }
 
@@ -1112,13 +1438,84 @@ std::string patchModelSound(const Character& model, const json& current, const j
     return out.str();
 }
 
-std::string patchStageMusic(const std::string& source, const Stage& stage, const std::string& music) {
+bool changedJumpField(const json& now, const json& original, const char* field) {
+    return now.at("entity").value(field,-1.f) != original.at("entity").value(field,-1.f);
+}
+
+std::string patchModelJump(const Character& model, const json& current, const json& baseline,
+                           const std::string& source) {
+    const bool heightChanged = changedJumpField(current,baseline,"jumpHeight");
+    const bool speedChanged = changedJumpField(current,baseline,"jumpSpeed");
+    const bool runHeightChanged = changedJumpField(current,baseline,"runningJumpHeight");
+    const bool runDistanceChanged = changedJumpField(current,baseline,"runningJumpDistance");
+    if (!heightChanged && !speedChanged && !runHeightChanged && !runDistanceChanged) return source;
     std::istringstream input(source), tokens;
     std::ostringstream out;
-    if (!music.empty()) out << "music " << music << ' ' << stage.musicOffset << '\n';
     std::string line;
-    while (std::getline(input,line))
-        if (nativeCommand(line,tokens) != "music") out << line << '\n';
+    bool header = true;
+    while (std::getline(input,line)) {
+        if (header) {
+            const auto command = nativeCommand(line,tokens);
+            if (heightChanged && (command == "jumpheight" || command == "jump_height")) continue;
+            if (speedChanged && (command == "jumpspeed" || command == "jumpspeedf" || command == "jump_speed")) continue;
+            if (runHeightChanged && command == "run.jump.y") continue;
+            if (runDistanceChanged && command == "run.jump.x") continue;
+            if (command == "anim") {
+                if (heightChanged && model.entity.jumpHeight >= 0) out << "jumpheight " << model.entity.jumpHeight << '\n';
+                if (speedChanged && model.entity.jumpSpeed >= 0) out << "jumpspeedf " << model.entity.jumpSpeed << '\n';
+                if (runHeightChanged && model.entity.runningJumpHeight >= 0) out << "run.jump.y " << model.entity.runningJumpHeight << '\n';
+                if (runDistanceChanged && model.entity.runningJumpDistance >= 0) out << "run.jump.x " << model.entity.runningJumpDistance << '\n';
+                header = false;
+            }
+        }
+        out << line << '\n';
+    }
+    return out.str();
+}
+
+std::string patchStageText(const std::string& source, const Stage& stage, const std::string& music,
+                           bool musicChanged, bool playerDepthChanged, const std::vector<StageTerrain>* originalTerrain) {
+    const auto newline = source.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+    std::istringstream input(source), tokens;
+    std::ostringstream out;
+    if (musicChanged && !music.empty()) out << "music " << music << ' ' << stage.musicOffset << newline;
+    std::string line;
+    size_t terrainIndex = 0;
+    const auto writeTerrain = [&] {
+        std::istringstream terrain(stageTerrainText(stage.terrain));
+        for (std::string entry; std::getline(terrain,entry);) out << entry << newline;
+    };
+    bool placed = false, script = false;
+    while (std::getline(input,line)) {
+        auto command = nativeCommand(line,tokens);
+        if (startsInlineScript(tokens)) script = true;
+        if (script) {
+            if (line.find("@end_script") != std::string::npos) script = false;
+            command.clear();
+        }
+        if (musicChanged && command == "music") continue;
+        if (playerDepthChanged && command == "spawn1") {
+            std::string x, altitude;
+            int oldDepth = 0;
+            if (tokens >> x) {
+                tokens >> oldDepth >> altitude;
+                out << "spawn1 " << x << ' ' << stage.playerZ-stage.laneTop << ' '
+                    << (altitude.empty() ? "0" : altitude) << newline;
+                playerDepthChanged = false;
+                continue;
+            }
+        }
+        if (originalTerrain && terrainIndex < originalTerrain->size()) {
+            if (const auto shape = readStageTerrain(command,tokens); shape && *shape == (*originalTerrain)[terrainIndex]) {
+                ++terrainIndex;
+                if (!placed) { writeTerrain(); placed = true; }
+                continue;
+            }
+        }
+        out << line << '\n';
+    }
+    if (playerDepthChanged) out << stagePlayerStartText(stage);
+    if (originalTerrain && !placed) writeTerrain();
     return out.str();
 }
 
@@ -1131,12 +1528,26 @@ std::string nativeExportRoot(const Project& project) {
     }
 }
 
-void writeNativeRegistry(const Project& project, const fs::path& root, const std::string& prefix) {
+void writeNativeRegistry(const Project& project, const std::map<std::string,json>& current,
+                         const fs::path& root, const std::string& prefix) {
     const std::string file = "data/models.txt";
     if (project.nativeEdits.contains(file)) return;
     std::map<std::string,const Character*> models;
-    for (const auto& model : project.characters)
+    std::set<std::string> preload;
+    for (const auto& model : project.characters) {
         if (!model.nativeFile.empty()) models.emplace(model.nativeFile,&model);
+        if (project.nativeEdits.contains(model.nativeFile)) continue;
+        const auto prev = project.nativeBaseline.find(model.nativeFile);
+        const auto original = prev == project.nativeBaseline.end() ? json{} : json::parse(prev->second);
+        for (size_t i = 0; i < model.animations.size(); ++i) {
+            const auto& clip = model.animations[i];
+            if (clip.frames.empty()) continue;
+            if (!original.is_null() && i < original.at("animations").size() &&
+                !spawnCuesChanged(current.at(model.nativeFile).at("animations")[i],original.at("animations")[i])) continue;
+            if (clip.subEntity.enabled) preload.insert(clip.subEntity.model);
+            if (clip.item.enabled) preload.insert(clip.item.model);
+        }
+    }
     std::istringstream input(nativeFileText(project,file)), tokens;
     std::ostringstream out;
     std::string line;
@@ -1151,9 +1562,9 @@ void writeNativeRegistry(const Project& project, const fs::path& root, const std
                 if (model == models.end()) { changed = true; continue; }
                 const auto original = json::parse(it->second);
                 const bool typeChanged = model->second->type != original.at("type").get<std::string>();
-                if (model->second->id != original.at("id").get<std::string>() || typeChanged) {
-                    out << (typeChanged ?
-                            (model->second->type == "player" ? "load" : "know") : command)
+                const bool promote = preload.contains(model->second->id) && command == "know";
+                if (model->second->id != original.at("id").get<std::string>() || typeChanged || promote) {
+                    out << (promote || model->second->type == "player" ? "load" : typeChanged ? "know" : command)
                         << ' ' << model->second->id << ' ' << path << '\n';
                     changed = true;
                     continue;
@@ -1165,7 +1576,7 @@ void writeNativeRegistry(const Project& project, const fs::path& root, const std
     for (const auto& model : project.characters) {
         if (!model.nativeFile.empty()) continue;
         changed = true;
-        out << (model.type == "player" ? "load " : "know ") << model.id << ' '
+        out << (model.type == "player" || preload.contains(model.id) ? "load " : "know ") << model.id << ' '
             << prefix << "chars/" << model.id << '/' << model.id << ".txt\n";
     }
     const auto commands = moduleModelsText(project.module);
@@ -1221,11 +1632,13 @@ void writeNativeLevels(const Project& project, const std::map<std::string,json>&
                 const auto& stage = project.stages[i];
                 const auto original = json::parse(base->second);
                 const auto& now = current.at(name);
-                const bool depth = now.at("laneTop") != original.at("laneTop") || now.at("laneBottom") != original.at("laneBottom");
+                const bool depth = now.at("laneTop") != original.at("laneTop") ||
+                                   now.at("laneBottom") != original.at("laneBottom") ||
+                                   stage.backgroundDepth != original.value("backgroundDepth",-1);
                 const bool before = now.at("before") != original.at("before");
                 const bool after = now.at("after") != original.at("after");
                 if (before) addScene(out,i,false);
-                if (depth) out << "z " << stage.laneTop << ' ' << stage.laneBottom << ' ' << stage.laneBottom << '\n';
+                if (depth) out << stageDepthText(stage);
                 out << line << '\n';
                 if (depth) out << restoreZ << '\n';
                 if (after) addScene(out,i,true);
@@ -1246,8 +1659,7 @@ void writeNativeLevels(const Project& project, const std::map<std::string,json>&
         }
         if (hasStage) out << "next\n";
         addScene(out,i,false);
-        out << "z " << stage.laneTop << ' ' << stage.laneBottom << ' ' << stage.laneBottom
-            << "\nfile " << prefix << "levels/" << counterName("stage_",i+1,".txt") << '\n';
+        out << stageDepthText(stage) << "file " << prefix << "levels/" << counterName("stage_",i+1,".txt") << '\n';
         addScene(out,i,true);
         changed = hasStage = true;
     }
@@ -1262,8 +1674,112 @@ void captureNativeBaseline(Project& project) {
         project.nativeBaseline.emplace(name,settings.dump());
 }
 
-fs::path exportProject(const Project& project, const fs::path& parent, Images& images, bool playable) {
-    verifyProject(project);
+fs::path existingExportData(const fs::path& target) {
+    auto path = fs::absolute(target).lexically_normal();
+    if (path.filename().empty() && path != path.root_path()) path = path.parent_path();
+    if (lower(utf8(path.filename())) != "data") path /= "data";
+    require(fs::is_directory(path), "Choose an existing data folder or its parent game folder.");
+    return path;
+}
+
+namespace {
+
+void preparePlaytest(const Project& project, const StagePlaytest& test, const fs::path& root,
+                     const std::string& prefix, bool native) {
+    const auto& stage = project.stages.at(test.stage);
+    const auto* player = findCharacter(project,test.player);
+    require(player && player->type == "player" && hasFrames(*player),"Choose a completed player model.");
+    const auto level = !stage.nativeFile.empty() ? stage.nativeFile : native
+        ? prefix+"levels/"+counterName("stage_",test.stage+1,".txt") : levelPath(test.stage);
+    const auto path = nativeOutputPath(project,level);
+    const auto modelsFile = root/nativeOutputPath(project,"data/models.txt");
+    const auto levelsFile = root/nativeOutputPath(project,"data/levels.txt");
+    auto playerId = player->id;
+    std::istringstream registry(readText(modelsFile)), tokens;
+    std::ostringstream models;
+    std::string line;
+    bool registered = false;
+    while (std::getline(registry,line)) {
+        const auto command = nativeCommand(line,tokens);
+        std::string name, model;
+        if ((command == "know" || command == "load") && tokens >> name >> std::quoted(model) &&
+            (player->nativeFile.empty() ? lower(name) == playerId : nativeReference(model) == player->nativeFile)) {
+            if (!registered) playerId = name;
+            registered = true;
+            if (command == "know") {
+                models << "load " << name << ' ' << model << '\n';
+                continue;
+            }
+        }
+        models << line << '\n';
+    }
+    require(registered,"The player is missing from models.txt.");
+    writeText(modelsFile,models.str());
+
+    std::istringstream order(readText(levelsFile));
+    std::ostringstream global;
+    std::string settings, branch;
+    bool inSet = false, found = false;
+    while (std::getline(order,line)) {
+        const auto command = nativeCommand(line,tokens);
+        if (command == "skiptoset") continue;
+        if (command == "set") {
+            inSet = true;
+            settings.clear();
+            branch.clear();
+            continue;
+        }
+        if (!inSet) { global << line << '\n'; continue; }
+        if (command == "branch") { branch = line+'\n'; continue; }
+        if (command == "file") {
+            std::string file;
+            if (tokens >> std::quoted(file) && nativeReference(file) == level) { found = true; break; }
+            branch.clear();
+            continue;
+        }
+        constexpr std::array excluded{"z","scene","select","skipselect","next","end","maxplayers","cansave","ifcomplete"};
+        if (std::find(excluded.begin(),excluded.end(),command) == excluded.end()) settings += line+'\n';
+    }
+    if (!found) { settings.clear(); branch.clear(); }
+    writeText(levelsFile,global.str()+"\nskiptoset 0\nset Test_Play\n"+settings+
+        "\nmaxplayers 1\ncansave 0\nskipselect "+playerId+'\n'+stageDepthText(stage)+branch+
+        "file "+utf8(path)+"\nend\n");
+
+    // A direct set launch has no Start button event to join player one.
+    const auto update = root/nativeOutputPath(project,"data/scripts/update.c");
+    std::string updateSource;
+    if (fs::exists(update)) {
+        updateSource = "#define main studio_playtest_update\n"+readText(update)+
+                       "\n#undef main\n#define STUDIO_PLAYTEST_HAS_UPDATE\n";
+    }
+    writeText(update,updateSource+R"(
+void main()
+{
+#ifdef STUDIO_PLAYTEST_HAS_UPDATE
+    studio_playtest_update();
+#endif
+    if (openborvariant("in_level") && !getglobalvar("studio_playtest_joined")) {
+        if (getplayerproperty(0,"entity"))
+            setglobalvar("studio_playtest_joined",1);
+        else
+            changeplayerproperty(0,"playkeys",openborconstant("FLAG_START"));
+    }
+}
+)");
+}
+}
+
+fs::path exportProject(const Project& project, const fs::path& selectedPath, Images& images, bool playable,
+                       ExportDestination mode, const StagePlaytest* playtest) {
+    if (playtest) {
+        require(playtest->stage < project.stages.size(),"Select a stage to test.");
+        auto checked = project;
+        checked.stages = {project.stages[playtest->stage]};
+        verifyProject(checked);
+        playable = true;
+    } else verifyProject(project);
+    if (mode == ExportDestination::existingPak) playable = true;
+    if (mode == ExportDestination::existingData) playable = false;
     const bool native = !project.nativeFiles.empty();
     if (playable && !native) {
         require(!project.stages.empty(), "A playable export needs at least one stage.");
@@ -1271,13 +1787,23 @@ fs::path exportProject(const Project& project, const fs::path& parent, Images& i
                             [](const Character& model) { return model.type == "player"; }),
                 "A playable export needs at least one player model.");
     }
-    const auto root = fs::absolute(parent);
-    fs::create_directories(root);
-    fs::path destination = root / "OpenBOR_Export";
-    for (int suffix = 2; fs::exists(destination); ++suffix) destination = root / ("OpenBOR_Export_" + std::to_string(suffix));
+    fs::path destination = fs::absolute(selectedPath).lexically_normal();
+    fs::path root = destination;
+    if (mode == ExportDestination::newFolder) {
+        fs::create_directories(root);
+        destination = root / "OpenBOR_Export";
+        for (int suffix = 2; fs::exists(destination); ++suffix)
+            destination = root / ("OpenBOR_Export_" + std::to_string(suffix));
+    } else {
+        if (mode == ExportDestination::existingData) destination = existingExportData(destination);
+        else require(mediaExtension(destination) == ".pak" && fs::is_regular_file(destination),
+                     "Choose an existing .pak file.");
+        root = destination.parent_path();
+    }
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto staging = root / (".borstudio-export-" + std::to_string(stamp));
     require(fs::create_directory(staging), "Could not create an export staging folder.");
+    bool keepStaging = false;
     try {
         std::vector<std::string> rebuilt;
         const auto current = native ? nativeValues(project) : std::map<std::string,json>{};
@@ -1295,12 +1821,30 @@ fs::path exportProject(const Project& project, const fs::path& parent, Images& i
                 if (project.nativeEdits.contains(modelFile)) continue;
                 const auto original = json::parse(project.nativeBaseline.at(modelFile));
                 const auto& now = current.at(modelFile);
-                if (modelWithoutSound(now) == modelWithoutSound(original)) {
-                    if (now.at("deathSound") != original.at("deathSound") ||
-                        now.at("animations") != original.at("animations"))
-                        writeText(staging/nativeDataPath(modelFile),
-                                  patchModelSound(model,now,original,nativeFileText(project,modelFile),staging,assetRoot));
+                if (modelWithoutSoundJumpOrSpawns(now) == modelWithoutSoundJumpOrSpawns(original)) {
+                    bool audioChanged = now.at("deathSound") != original.at("deathSound"), spawnsChanged = false;
+                    for (size_t a = 0; a < model.animations.size(); ++a) {
+                        const auto& clip = now.at("animations")[a];
+                        const auto& old = original.at("animations")[a];
+                        audioChanged = audioChanged || clip.at("frames") != old.at("frames");
+                        spawnsChanged = spawnsChanged || spawnCuesChanged(clip,old);
+                    }
+                    const bool jumpChanged = changedJumpField(now,original,"jumpHeight") ||
+                                             changedJumpField(now,original,"jumpSpeed") ||
+                                             changedJumpField(now,original,"runningJumpHeight") ||
+                                             changedJumpField(now,original,"runningJumpDistance");
+                    if (audioChanged || jumpChanged || spawnsChanged) {
+                        auto source = nativeFileText(project,modelFile);
+                        if (audioChanged) source = patchModelSound(model,now,original,source,staging,assetRoot);
+                        if (spawnsChanged) source = patchModelSpawns(project,model,now,original,source);
+                        writeText(staging/nativeOutputPath(project,modelFile),patchModelJump(model,now,original,source));
+                    }
                     continue;
+                }
+                for (const auto& animation : model.animations) {
+                    if (animation.frames.empty()) continue;
+                    validateCue(animation.subEntity,animation,project);
+                    validateCue(animation.item,animation,project);
                 }
                 rebuilt.push_back(modelFile);
             }
@@ -1360,16 +1904,27 @@ fs::path exportProject(const Project& project, const fs::path& parent, Images& i
             writeText(staging/nativeDataPath(modelFile),modelText(model,mesh.get(),assetRoot));
         }
         for (size_t i = 0; i < project.stages.size(); ++i) {
+            if (playtest && i != playtest->stage) continue;
             const auto& stage = project.stages[i];
             const auto level = stage.nativeFile.empty() ?
                 (native ? prefix+"levels/"+counterName("stage_",i+1,".txt") : levelPath(i)) : stage.nativeFile;
-            bool rebuild = true, musicChanged = true;
+            const auto cameraScript = (native ? prefix+"scripts/" : "data/scripts/")+
+                                      counterName("studio_camera_",i+1,".c");
+            std::string cameraBody;
+            bool rebuild = true, musicChanged = true, playerDepthChanged = false;
+            std::optional<std::vector<StageTerrain>> originalTerrain;
+            StageCamera originalCamera;
             std::string music;
             if (native && !stage.nativeFile.empty()) {
                 if (project.nativeEdits.contains(level)) continue;
                 const auto original = json::parse(project.nativeBaseline.at(level));
+                originalCamera = original.value("camera",StageCamera{});
                 const auto& now = current.at(level);
-                rebuild = stageWithoutMedia(now) != stageWithoutMedia(original);
+                rebuild = stageWithoutMediaOrTerrain(now) != stageWithoutMediaOrTerrain(original);
+                playerDepthChanged = stage.playerZ-stage.laneTop !=
+                                     original.at("playerZ").get<int>()-original.at("laneTop").get<int>();
+                const auto terrain = original.value("terrain",std::vector<StageTerrain>{});
+                if (stage.terrain != terrain) originalTerrain = terrain;
                 musicChanged = now.at("music") != original.at("music") || now.at("musicOffset") != original.at("musicOffset");
                 if (now.at("music") == original.at("music")) {
                     const auto name = utf8(now.at("music").get<fs::path>());
@@ -1388,7 +1943,19 @@ fs::path exportProject(const Project& project, const fs::path& parent, Images& i
                 exportScene(stage.after,staging,stageSceneName(i,true));
             }
             if (!rebuild) {
-                if (musicChanged) writeText(staging/nativeDataPath(level),patchStageMusic(nativeFileText(project,level),stage,music));
+                if (musicChanged || playerDepthChanged || originalTerrain || stage.camera != originalCamera) {
+                    auto source = nativeFileText(project,level);
+                    if (musicChanged || playerDepthChanged || originalTerrain)
+                        source = patchStageText(source,stage,music,musicChanged,playerDepthChanged,
+                                                originalTerrain ? &*originalTerrain : nullptr);
+                    if (stage.camera != originalCamera)
+                        source = applyStageCamera(source,stage.camera,
+                            stage.camera.zoom != originalCamera.zoom || stage.camera.nativeZoom != originalCamera.nativeZoom,
+                            stage.camera.offsetX != originalCamera.offsetX || stage.camera.offsetY != originalCamera.offsetY,
+                            stage.camera.followAltitude != originalCamera.followAltitude,cameraScript,&cameraBody);
+                    writeText(staging/nativeOutputPath(project,level),source);
+                    if (!cameraBody.empty()) writeText(staging/nativeDataPath(cameraScript),cameraBody);
+                }
                 continue;
             }
             const auto artRoot = native ? prefix+"bgs/"+counterName("stage_",i+1,"/") : artPath(i);
@@ -1403,10 +1970,11 @@ fs::path exportProject(const Project& project, const fs::path& parent, Images& i
             const auto sizes = panelSizes(stage,images);
             const auto layout = stageArtLayout(stage,sizes);
             exportStagePanels(stage,layout,sizes,art,images);
-            writeText(staging/nativeDataPath(level),stageTextWithLayout(stage,i,layout,artRoot,music));
+            writeText(staging/nativeDataPath(level),stageTextWithLayout(stage,i,layout,artRoot,music,cameraScript,&cameraBody));
+            if (!cameraBody.empty()) writeText(staging/nativeDataPath(cameraScript),cameraBody);
         }
         if (native) {
-            writeNativeRegistry(project,staging,prefix);
+            writeNativeRegistry(project,current,staging,prefix);
             writeNativeLevels(project,current,staging,prefix);
             const auto original = json::parse(project.nativeBaseline.at("data/studio-module"));
             const auto& now = current.at("data/studio-module");
@@ -1440,7 +2008,9 @@ fs::path exportProject(const Project& project, const fs::path& parent, Images& i
             writeText(staging/"data/video.txt","video 0\n"+project.module.videoHeader+"\n");
             exportModuleArtwork(project,staging,images,playable);
         }
-        if (playable) writePlayablePak(staging,project.title);
+        fs::path pak;
+        if (playtest) preparePlaytest(project,*playtest,staging,prefix,native);
+        if (playable) pak = writePlayablePak(staging,project.title);
         writeText(staging/"README.txt",
             "OpenBOR Studio content export\n\n"
             + std::string(playable ?
@@ -1449,21 +2019,57 @@ fs::path exportProject(const Project& project, const fs::path& parent, Images& i
                 "Merge the registrations and settings in data/models.txt and data/levels.txt into your existing module. "
                 "Screen assets appear under data when you set them in Module > Screens.\n")
             + std::string(native ? "The export includes the imported data tree and any Native TXT edits.\n" :
-                                   "Video mode 0 uses 320x240. Projectile XYZ offsets target recent OpenBOR 4.x engine builds.\n")
+                                   "Video mode 0 uses 320x240. Sub Entity spawn positions are relative to the parent model.\n")
             + (std::any_of(project.characters.begin(),project.characters.end(),[](const Character& model) {
                 return !model.mesh.file.empty();
             }) ? "This export requires OpenBOR3D with meshmodel and meshclip support.\n" : "")
+            + (std::any_of(project.stages.begin(),project.stages.end(),[](const Stage& stage) {
+                return stage.camera.nativeZoom && stage.camera.zoom != 100;
+            }) ? "Native camera zoom requires OpenBOR3D with camerazoom support.\n" : "")
             + [&] {
                 std::string note;
                 if (!rebuilt.empty()) note = "\nStudio regenerated these visually edited files. Review any custom commands against the originals in Native TXT.\n";
                 for (const auto& file : rebuilt) note += file+'\n';
                 return note;
             }());
-        fs::rename(staging, destination);
+        if (mode == ExportDestination::existingPak) {
+            require(MoveFileExW(pak.c_str(),destination.c_str(),MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH),
+                    "Could not replace "+utf8(destination)+". Close OpenBOR if it is using this PAK.");
+        } else if (mode == ExportDestination::existingData) {
+            const auto merged = staging/"merged";
+            const auto original = staging/"original";
+            const auto ordinary = [](const fs::path& path) {
+                const auto flags = GetFileAttributesW(path.c_str());
+                require(flags != INVALID_FILE_ATTRIBUTES && !(flags & FILE_ATTRIBUTE_REPARSE_POINT),
+                        "Cannot update a data folder containing a linked path: "+utf8(path));
+            };
+            ordinary(destination);
+            for (const auto& entry : fs::recursive_directory_iterator(destination)) ordinary(entry.path());
+            fs::copy(destination,merged,fs::copy_options::recursive);
+            fs::copy(staging/"data",merged,fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+            fs::rename(destination,original);
+            try {
+                fs::rename(merged,destination);
+            } catch (...) {
+                std::error_code error;
+                fs::rename(original,destination,error);
+                if (error) {
+                    keepStaging = true;
+                    throw std::runtime_error("Could not restore the data folder. Your original files are in "+utf8(original)+".");
+                }
+                throw;
+            }
+        } else {
+            fs::rename(staging,destination);
+        }
     } catch (...) {
         std::error_code ec;
-        fs::remove_all(staging,ec);
+        if (!keepStaging) fs::remove_all(staging,ec);
         throw;
+    }
+    if (mode != ExportDestination::newFolder) {
+        std::error_code error;
+        fs::remove_all(staging,error);
     }
     return destination;
 }

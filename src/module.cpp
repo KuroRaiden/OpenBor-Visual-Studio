@@ -248,7 +248,7 @@ void exportModuleArtwork(const Project& project, const fs::path& root, Images& i
     }
 }
 
-void writePlayablePak(const fs::path& root, const std::string& title) {
+fs::path writePlayablePak(const fs::path& root, const std::string& title) {
     std::vector<fs::path> assets;
     for (const auto& item : fs::recursive_directory_iterator(root/"data")) {
         if (item.is_regular_file()) assets.push_back(item.path());
@@ -293,6 +293,7 @@ void writePlayablePak(const fs::path& root, const std::string& title) {
     number(table,fieldWidth);
     pak.close();
     if (!pak) throw std::runtime_error("Could not write "+utf8(path.filename())+".");
+    return path;
 }
 
 }

@@ -5,9 +5,13 @@ A native Windows editor for OpenBOR character models and side-scrolling stages. 
 ## Start here
 
 1. Unzip the Windows package and launch **OpenBOR Studio.exe**. It starts with a blank project. Click **+ New model** or use an import button to start a character, or switch to **Stages** to create a stage.
-2. Choose **Project → Open demo** to try the included **Training Ground** project. Press **Space** to play Goku’s attack animation. The cyan marker shows the projectile origin and the amber marker shows the item origin. Click **Stages** to open the canyon stage. Keep the **Demo** folder beside the executable to use this example.
+2. Choose **Project → Open demo** to try the included **Training Ground** project. Press **Space** to play Goku’s attack animation. The cyan marker shows where the Ki Blast spawns as a Sub Entity, and the amber marker shows where the item spawns. Click **Stages** to open the canyon stage. Keep the **Demo** folder beside the executable to use this example.
 3. Use **Project → Open project** to load an existing project. **Save** stores a **.borstudio** file and a sibling **.assets** directory. Keep them together when moving a project.
 4. Use **Export** and select **Playable module** or **Content for an existing module**. Choose a destination. The dialog shows the full path of the new **OpenBOR_Export** directory and any errors that need attention.
+
+In the export destination menu, choose **Replace an existing PAK** to write the complete build to a selected PAK. Choose **Update an existing data folder** to overwrite matching files while keeping files outside the export. Studio prepares the output before replacing files.
+
+Studio caches unsaved edits every eight minutes. It keeps the two most recent snapshots for crash recovery, including projects that have never been saved. On restart, choose **Recover latest**, or use **Project → Recover autosave** from a clean workspace. Save the recovered work as a project to keep it. Recovery copies are stored locally under **%LOCALAPPDATA%\OpenBOR Studio\Recovery**.
 
 Drag the dotted divider beside the right inspector to resize it. Double-click the divider to reset its width. When the tabs extend past the panel, use the arrows or the tab list to switch tabs.
 
@@ -19,6 +23,7 @@ Drag the dotted divider beside the right inspector to resize it. Double-click th
 
 ## Characters
 
+- **Models** and **Animations** scroll independently. Select a model to see its clips in the Animations panel below.
 - **New model** creates a model with an Idle animation. Set its ID, type, health and speed under **Inspector → Entity**. This tab also provides MP, aggression, score, jump height, lifespan, collision defaults and the HUD portrait. Use OpenBOR animation IDs such as `idle`, `walk`, `attack1`, and `freespecial1`.
 - **+ Frames** imports multiple images into the selected clip in filename order. Use zero-padded numbers to sort correctly. Click frames to scrub, drag the thumbnails to reorder, and set each delay in centiseconds. Enable **Onion skin** to overlay the previous frame at its own pivot. On the first frame of a looping clip, the overlay uses the last frame. 
 - **Import sprite pack** accepts an extracted DBZ character folder such as **Goku [060]**. Select the source facing for right-facing OpenBOR artwork. Studio reads the parent **frames.csv** when available to retain the original pivots. It maps the first group to Idle, group 1 to Walk if present, and remaining groups to Free Special slots. Review clip names and timing for the character you are building.
@@ -26,9 +31,18 @@ Drag the dotted divider beside the right inspector to resize it. Double-click th
 - Use **Origin → Place pivot** to click a point on the sprite, or **Origin → Drag sprite** to slide the current frame around the fixed pivot. A drag can be undone in one step. Use **Body** or **Attack** and drag a rectangle. The inspector has numeric inputs for precise edits.
 - In **Inspector → Frame**, choose **Copy previous boxes** and select **Body**, **Attack**, or **Both**. Each copied box includes its enabled state and settings. On the first frame of a looping clip, the button copies from the last frame. Undo restores the prior settings in one step.
 - In the preview, use **Select** and click the sprite, pivot, a collision box, or a spawn marker. With the preview focused, the arrow keys nudge the selection one pixel at a time. Nudging a pivot changes its position on the sprite. Nudging the sprite moves it around the fixed pivot. Use the small up and down arrows beside a number to change it by one.
-- **Inspector → Spawns** has one projectile cue and one relative item or subentity cue per clip. Pick a model and trigger frame. **Place in preview** lets you set the X and altitude visually at the selected Z. Positive X is forward, positive Z moves down the screen, and positive altitude moves up. **Facing left/right** mirrors the sprite and the relative X positions. **Spawn ghost** shows the referenced model and a visual preview of projectile travel.
+- Press **<** or **,** to step back one frame, and **>** or **.** to step forward. Stepping pauses playback. Looping clips wrap at their ends.
+- **Inspector → Spawns** lets you select a Sub Entity model, trigger frame, and parent-relative position. **Place in preview** sets X and altitude visually at the selected Z. Positive X is forward, positive Z moves down the screen, and positive altitude moves up. **Facing left/right** mirrors the relative X positions. **Spawn ghost** shows the referenced model at its spawn point. The separate item cue can spawn an item in the same clip.
 - **Effects** sets scale, flip, rotation, and the OpenBOR blend mode for the current frame. The preview shows transforms and alpha masks. Blend modes are applied by OpenBOR. Collision boxes stay in gameplay coordinates. Use a matching grayscale mask file or generate a mask from the sprite's own alpha channel.
 - **Palettes** builds a shared palette from the model's frames. Select a swatch to edit it or create an alternate from the current palette. The selected palette previews on the active frame. Palette entry zero is reserved for transparency.
+
+## Jump simulator
+
+Open **Characters → Jump simulator** above the animation preview. Choose **Standing**, **Forward**, or **Running**. Play the jump, scrub the time slider, or click **Apex** to inspect the highest point. The preview reports peak height, horizontal travel, and time in the air.
+
+Edit the model's launch values directly in the simulator. They save with the project and export as OpenBOR model commands. A value of `-1` inherits the module or existing native settings. Select a stage to use its gravity and velocity limits, or use **Preview gravity override** to experiment with gravity for the current preview.
+
+Studio plays `jumpdelay` and `jumpland` when present and selects the relevant `jump`, `forwardjump`, or `runjump` animation. The simulator models a flat floor. Stage collisions, air controls, scripts, and animation commands that move the entity are evaluated during gameplay.
 
 ## OpenBOR3D characters
 
@@ -39,6 +53,19 @@ Drag the dotted divider beside the right inspector to resize it. Double-click th
 - The fork accepts triangle skins with up to four joint influences, LINEAR or STEP joint animation, and embedded PNG base-color textures. It currently has a 32 MiB GLB limit and does not render morph targets or blended materials.
 
 ## Stages
+
+Choose **Test Play** above the stage canvas. Link your Windows OpenBOR executable once, select a player model, and click **Play selected stage**. Studio builds the current edits in a temporary module and opens the selected level directly in a separate OpenBOR window. Use a compatible OpenBOR3D build for GLB projects. Use **Test running** to stop the session or open its logs.
+
+### Stage camera
+
+Choose **Camera** above the stage canvas to see the game framing. Adjust **Game camera zoom** from 50% to 200%, or choose Wide, Normal, or Close. Use **Preview X** to inspect the framing at different points along the stage. The camera offset controls scrolling focus, and **Follow jump height** lets the camera follow player altitude within the level's scroll limits.
+
+Studio saves the camera per stage and includes it in Test Play, data exports, and PAK exports. Stock OpenBOR uses a generated stage script for 2D zoom. A wide view can expose black edges around the stage. Choose **OpenBOR3D / GLB** and link the updated fork for native zoom with GLB characters and props.
+
+- **Terrain → Lock to side-view lane** fixes player depth for a 2D platformer. **Ground Z** moves that lane up or down. Use the **Stage** tab to restore a wider Z range.
+- In **Terrain**, choose **+ Platform** and click the left end of its top, or choose **+ Pit** and click where the pit begins. Drag selected terrain or use the arrow keys to nudge it. Set width, Z coverage, and altitude in the inspector.
+- Platforms are solid raised surfaces exported as OpenBOR `wall` commands. Pits use `hole`. The colored guides show collision geometry in Studio. Use the stage's panel artwork for the visible platforms and gaps in the game. Characters need to be subject to walls or holes for the corresponding collision to apply.
+- Opening a native module makes its rectangular walls and pits available in the Terrain panel. Irregular terrain can be edited in **Native TXT**.
 
 - Add a stage, then choose a background and add one or more panels. Panels define stage width and are stitched left to right. The stage preview shows a 320 × 240 camera window, the walkable Z band and player start.
 - Select the background or a panel in the Artwork list, then drag in the preview to move it. Use the arrow keys with the preview focused or set pixel offsets under **Inspector → Artwork**. Panel X offsets are measured from the panel's stitched position. Use **Reset position** to return to that position, or click **Move artwork** to return to editing spawn markers.
@@ -72,7 +99,7 @@ Click **TXT** to add OpenBOR commands in the context of the selected model, anim
 
 Studio creates indexed 8-bit PNGs with palette index zero reserved for transparency. A model uses one shared palette across its frames. Images with over 255 opaque colors are quantized, and partially transparent pixels are thresholded. The editor previews the source images.
 
-Export targets OpenBOR 4.x, using `custknife`, `throwframe`, and the `projectile_position_*` and `projectile_velocity_*` commands for the projectile, and `subentity` / `spawnframe` for a relative item spawn. Projectile ghost motion and stage camera rendering are editor previews. Physics, AI, scripts, and gameplay are handled by OpenBOR.
+Export targets OpenBOR 4.x and uses `subentity` and `spawnframe`. When a clip has both a Sub Entity and an item cue, Studio uses an inline animation script for the additional item. Older Studio projects retain their projectile model, trigger frame, and offsets as a Sub Entity. Author movement and attack boxes in the spawned model's animations. For example, use `move` in the spawned model's frame commands to move it forward.
 
 **Playable module** adds starter art and distinct regular and selected menu fonts wherever you have left the defaults. It creates a PAK for a project with a playable character and stage. Copy the generated PAK into the **Paks** directory of OpenBOR 4.x. The export also includes the editable **data** folder. **Content for an existing module** includes your edited screen assets along with models, stage graphics, settings, and registrations. The default video configuration is 320 × 240.
 
@@ -91,7 +118,7 @@ Run **build/Release/OpenBOR Studio.exe**. CMake copies **Demo** and **ScreenTemp
 
 - [OpenBOR engine](https://github.com/DCurrent/openbor)
 - [OpenBOR Legacy Manual](https://chronocrash.com/openbor/wiki/index.php/Legacy_Manual)
-- [OpenBOR projectile commands](https://chronocrash.com/obor/wiki/projectile/)
+- [OpenBOR Sub Entity](https://chronocrash.com/obor/wiki/sub-entity/)
 - [HUD](https://chronocrash.com/obor/wiki/heads-up-display-hud/)
 - [Character Select](https://chronocrash.com/obor/wiki/select-screen/)
 - [Draw effects](https://chronocrash.com/openbor/wiki/index.php/Graphics_Overview#Draw_Effects)

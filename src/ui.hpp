@@ -1,13 +1,16 @@
 #pragma once
 #include "mesh.hpp"
 #include "commands.hpp"
+#include "jump.hpp"
+#include "recovery.hpp"
+#include "playtest.hpp"
 #include "imgui.h"
 #include <windows.h>
 #include <optional>
 
 namespace studio {
 
-enum class EditTool { select, origin, body, attack, projectile, item, sprite };
+enum class EditTool { select, origin, body, attack, subEntity, item, sprite };
 enum class OriginMode { placePivot, dragSprite };
 
 class Editor {
@@ -15,9 +18,16 @@ public:
     Editor(HWND window, ID3D11Device* device, const fs::path& sample);
     void draw();
     void setCaptureView(bool stage);
+    void updateBackgroundTasks();
+    void initializeSession();
     void requestClose() { replace("Close"); }
 private:
-    enum class StageSelection { none, spawn, player, background, panel };
+    enum class StageSelection { none, spawn, player, background, panel, terrain };
+    struct TerrainDrag {
+        ScreenPoint start;
+        StageTerrain original;
+        bool changed = false;
+    };
     struct View { float zoom; ImVec2 pan{}; };
     struct InspectorLayout { float preview, width, minimum, maximum; };
     struct SpriteDrag {
@@ -41,6 +51,14 @@ private:
     Images images_;
     ComPtr<ID3D11SamplerState> stageBackgroundSampler_;
     Project project_;
+    Recovery recovery_;
+    Playtest playtest_;
+    std::string testPlayer_, testError_;
+    bool showPlaytest_ = false;
+    std::chrono::steady_clock::time_point nextAutosave_ = std::chrono::steady_clock::now()+Recovery::interval;
+    fs::path recoveryOffer_;
+    std::string recoveryError_;
+    bool showRecovery_ = false;
     fs::path file_, sample_;
     std::vector<Project> undo_, redo_;
     std::string status_, renameInput_;
@@ -49,6 +67,8 @@ private:
     bool stageMode_ = false, placeSpawn_ = false, importDialog_ = false, confirmReplace_ = false;
     bool moduleMode_ = false, showExport_ = false, playableExport_ = false;
     fs::path exportedTo_;
+    fs::path exportTarget_;
+    ExportDestination exportDestination_ = ExportDestination::newFolder;
     std::string exportError_;
     int paletteIndex_ = 0, paletteColor_ = 1, layoutSelection_ = 0;
     bool layoutSelectMode_ = false, layoutDragging_ = false, layoutChanged_ = false;
@@ -63,6 +83,8 @@ private:
     std::unique_ptr<GlbModel> glb_;
     std::optional<MeshPreview> meshPreview_;
     bool selectGlbTab_ = false;
+    bool revealModel_ = false, revealAnimation_ = false;
+    bool revealFrame_ = false;
     CommandContext commandContext_ = CommandContext::model;
     std::string commandDraft_, commandFilter_, commandReference_, commandGenerated_;
     std::string nativeSelection_, nativeDraft_, nativeSaved_, nativeFilter_, nativeError_;
@@ -73,6 +95,11 @@ private:
     int camera_ = 0, dragSpawn_ = -1;
     float playbackSeconds_ = 0, cueAge_ = -1.0f, itemAge_ = -1.0f;
     float playbackSpeed_ = 1.0f;
+    JumpMode jumpMode_ = JumpMode::forward;
+    int jumpStage_ = -1;
+    float jumpTime_ = 0;
+    std::optional<float> jumpGravity_;
+    bool jumpOpen_ = false, jumpPlaying_ = false;
     std::optional<float> inspectorWidth_;
     float inspectorDragWidth_ = 0;
     View characterView_{4.0f}, stageView_{1.0f};
@@ -80,7 +107,13 @@ private:
     EditTool characterSelection_ = EditTool::select;
     StageSelection stageSelection_ = StageSelection::spawn;
     std::optional<SpriteDrag> stageArtworkDrag_;
+    std::optional<TerrainDrag> terrainDrag_;
+    std::optional<bool> terrainPlacement_;
+    int terrain_ = 0;
+    bool selectTerrainTab_ = false;
     bool selectStageArtworkTab_ = false;
+    bool selectStageCameraTab_ = false;
+    bool stageCameraPreview_ = false;
     OriginMode originMode_ = OriginMode::placePivot;
     std::optional<SpriteDrag> spriteDrag_;
     ImVec2 dragFrom_{}, spawnDragOffset_{};
@@ -91,6 +124,7 @@ private:
     void history(bool forward);
     void normalizeSelection();
     void resetPlayback(bool play = false);
+    void stepFrame(const Animation& animation, int direction);
     void setModel(int index);
     void setAnimation(int index);
     void newModel();
@@ -109,14 +143,19 @@ private:
     GlbModel* meshAsset(const fs::path& path);
     void meshInspector(Character& model, Animation* animation);
     void drawMesh(ImDrawList* draw, const MeshSettings& settings, const Animation& animation,
-                  ImVec2 start, ImVec2 size, ImVec2 origin, float zoom);
+                  ImVec2 start, ImVec2 size, ImVec2 origin, float zoom, size_t frameIndex);
     void tick(Animation& animation);
     void drawHeader();
     void drawStatus();
     void drawModals();
+    void recoveryDialog();
+    void playtestDialog();
     void openCommands(CommandContext context);
     void commandsDialog();
     void nativeDialog();
+    void jumpSimulator();
+    void jumpCanvas(const Character& model, const Animation* animation, size_t frameIndex,
+                    const JumpArc& arc, const JumpPoint& point);
     void selectNativeFile(const std::string& name);
     std::string* commandText(Project& project, CommandContext context) const;
     void exportDialog();
@@ -134,6 +173,7 @@ private:
     void characterWorkspace(float left, float height);
     void stageWorkspace(float left, float height);
     void characterLibrary();
+    void animationLibrary();
     void frameInspector(Character& character, Animation* animation);
     void characterCanvas(Animation* animation, float height);
     void timeline(Animation* animation, float height);
@@ -144,7 +184,11 @@ private:
     void selectStageArtwork(StageSelection selection);
     ScreenPoint* stageArtworkOffset(Stage& stage);
     void stageArtworkInspector(Stage& stage);
-    void drawCue(SpawnCue& cue, const char* label, bool projectile, Animation& animation);
+    void stageTerrainInspector(Stage& stage);
+    void stageCameraInspector(Stage& stage);
+    void drawStageTerrain(Stage& stage, ImDrawList* draw, ImVec2 origin, float zoom, bool hovered);
+    void selectTerrain(int index);
+    void drawCue(SpawnCue& cue, const char* label, EditTool mode, Animation& animation);
     bool chooseModel(const char* label, std::string& id, bool emptyAllowed);
 };
 

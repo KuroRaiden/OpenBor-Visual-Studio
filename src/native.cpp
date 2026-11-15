@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -56,6 +57,66 @@ std::string nativeCommand(std::string_view line, std::istringstream& tokens) {
     return lower(command);
 }
 
+bool startsInlineScript(std::istringstream& tokens) {
+    const auto pos = tokens.tellg();
+    std::string argument;
+    tokens >> argument;
+    tokens.clear();
+    if (pos != std::streampos(-1)) tokens.seekg(pos);
+    return lower(argument) == "@script";
+}
+
+StageCamera readStageCamera(const std::string& source) {
+    StageCamera camera;
+    std::istringstream input(source), tokens;
+    bool script = false;
+    for (std::string line; std::getline(input,line);) {
+        if (script) {
+            if (line.find("@end_script") != std::string::npos) script = false;
+            continue;
+        }
+        constexpr std::string_view marker = "# studio_camera_zoom ";
+        const bool generated = line.starts_with(marker);
+        if (generated) line = "camerazoom "+line.substr(marker.size());
+        if (const auto command = nativeCommand(line,tokens); command == "camerazoom") {
+            int zoom;
+            if (tokens >> zoom) {
+                camera.zoom = zoom > 0 ? std::clamp(zoom,cameraZoomMin,cameraZoomMax) : 100;
+                camera.nativeZoom = !generated;
+            }
+        } else if (command == "cameraoffset") {
+            tokens >> camera.offsetX >> camera.offsetY;
+        } else if (command == "cameratype") {
+            int type = 0;
+            tokens >> type;
+            camera.followAltitude = type == 1;
+        } else if (startsInlineScript(tokens)) {
+            script = line.find("@end_script") == std::string::npos;
+        }
+    }
+    return camera;
+}
+
+std::optional<StageTerrain> readStageTerrain(std::string_view command, std::istringstream& tokens) {
+    if (command != "wall" && command != "hole") return {};
+    std::array<int,9> values{};
+    size_t count = 0;
+    for (std::string token; tokens >> token;) {
+        if (count == values.size()) return {};
+        std::istringstream number(token);
+        double value;
+        if (!(number >> value) || number.peek() != EOF || !std::isfinite(value) ||
+            std::abs(value) > stageTerrainLimit || value != std::trunc(value)) return {};
+        values[count++] = int(value);
+    }
+    const bool pit = command == "hole";
+    const auto [x,z,upperLeft,lowerLeft,upperRight,lowerRight,depth,altitude,type] = values;
+    if (count < (pit ? 7u : 8u) || upperLeft != lowerLeft || upperRight != lowerRight ||
+        upperRight <= upperLeft || depth <= 0 || altitude < (pit ? 0 : 1) ||
+        std::abs(x+upperLeft) > stageTerrainLimit || upperRight-upperLeft > stageTerrainLimit) return {};
+    return StageTerrain{pit,x+upperLeft,z,upperRight-upperLeft,depth,altitude,type};
+}
+
 namespace {
 
 uint64_t little(std::istream& file, int bytes) {
@@ -100,23 +161,37 @@ ScreenScene readScene(const Project& project, const std::string& name) {
     return scene;
 }
 
-Stage readStage(const Project& project, const std::string& name, int top, int bottom) {
+Stage readStage(const Project& project, const std::string& name, int top, int bottom, int backgroundDepth) {
     Stage stage;
     stage.nativeFile = name;
     stage.title = utf8(pathFromUtf8(name).stem());
     stage.laneTop = top;
     stage.laneBottom = bottom;
+    stage.backgroundDepth = backgroundDepth;
     stage.playerZ = std::clamp(stage.playerZ,top,bottom);
     StageSpawn spawn;
     bool pendingSpawn = false, pendingWait = false;
     std::string order;
     std::vector<StagePanel> panels;
-    std::istringstream input(nativeFileText(project,name)), tokens;
+    const auto source = nativeFileText(project,name);
+    stage.camera = readStageCamera(source);
+    std::istringstream input(source), tokens;
     std::string line;
+    bool script = false;
     while (std::getline(input,line)) {
+        if (script) {
+            if (line.find("@end_script") != std::string::npos) script = false;
+            continue;
+        }
         const auto command = nativeCommand(line,tokens);
+        if (startsInlineScript(tokens)) {
+            script = line.find("@end_script") == std::string::npos;
+            continue;
+        }
         std::string value;
-        if (command == "background" && stage.background.empty() && tokens >> std::quoted(value)) {
+        if (command == "wall" || command == "hole") {
+            if (const auto terrain = readStageTerrain(command,tokens)) stage.terrain.push_back(*terrain);
+        } else if (command == "background" && stage.background.empty() && tokens >> std::quoted(value)) {
             stage.background = asset(project,value,{".png",".gif",".bmp"});
             float xRatio, zRatio;
             int xSpace, ySpace, xRepeat = -1, yRepeat = -1;
@@ -297,7 +372,7 @@ Project importModule(const fs::path& folder, Images& images, int& skipped) {
         } catch (const std::exception&) { ++skipped; }
     }
     std::istringstream order(nativeFileText(project,"data/levels.txt"));
-    int top = 160, bottom = 230;
+    int top = 160, bottom = 230, backgroundDepth = -1;
     std::string before;
     size_t lastStage = size_t(-1);
     while (std::getline(order,line)) {
@@ -319,9 +394,13 @@ Project importModule(const fs::path& folder, Images& images, int& skipped) {
             }
         }
         if (command == "z") {
-            tokens >> top >> bottom;
-            top = std::clamp(top,0,239);
-            bottom = std::clamp(bottom,top,239);
+            int first = 0, last = 0, reference = 0;
+            if (tokens >> first >> last) {
+                top = std::clamp(first > 0 ? first : 160,0,239);
+                bottom = std::clamp(last > 0 ? last : 230,top,239);
+                tokens >> reference;
+                backgroundDepth = reference > 0 ? reference : 160;
+            }
         }
         if (command != "file") continue;
         std::string file;
@@ -331,7 +410,7 @@ Project importModule(const fs::path& folder, Images& images, int& skipped) {
         if (levels.insert(name).second) {
             if (!project.nativeFiles.contains(name)) ++skipped;
             else try {
-                auto stage = readStage(project,name,top,bottom);
+                auto stage = readStage(project,name,top,bottom,backgroundDepth);
                 if (!before.empty()) {
                     stage.before = readScene(project,before);
                     if (!stage.before.file.empty()) stage.nativeBeforeFile = before;

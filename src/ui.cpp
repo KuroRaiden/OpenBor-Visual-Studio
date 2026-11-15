@@ -146,8 +146,10 @@ bool numberFields(const char* label, std::initializer_list<NumberField<T>> field
 }
 
 std::array<int,2> viewerNudge(bool selected) {
+    const auto& io = ImGui::GetIO();
     if (!selected || !ImGui::IsWindowFocused() || ImGui::IsAnyItemActive() ||
-        ImGui::GetIO().WantTextInput || ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId)) return {};
+        io.WantTextInput || io.KeyCtrl || io.KeyAlt || io.KeySuper ||
+        ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId)) return {};
     constexpr auto repeat = ImGuiInputFlags_Repeat;
     const bool right = ImGui::Shortcut(ImGuiKey_RightArrow,repeat);
     const bool left = ImGui::Shortcut(ImGuiKey_LeftArrow,repeat);
@@ -388,6 +390,31 @@ void Editor::setCaptureView(bool stage) {
     stageMode_ = stage;
 }
 
+void Editor::initializeSession() {
+    try { playtest_.loadEngine(); }
+    catch (const std::exception& error) { status_ = error.what(); }
+    try {
+        recovery_.initialize();
+        recoveryOffer_ = recovery_.latest();
+        showRecovery_ = !recoveryOffer_.empty();
+    } catch (const std::exception& error) { status_ = error.what(); }
+}
+
+void Editor::updateBackgroundTasks() {
+    if (auto message = playtest_.update(); !message.empty()) {
+        status_ = std::move(message);
+        testError_ = status_.starts_with("Test play failed.") || status_.starts_with("OpenBOR test exited with code")
+            ? status_ : std::string{};
+    }
+    if (auto message = recovery_.finish(); !message.empty()) status_ = std::move(message);
+    const auto now = std::chrono::steady_clock::now();
+    if (now < nextAutosave_) return;
+    nextAutosave_ = now+Recovery::interval;
+    if (!dirty_) return;
+    try { recovery_.autosave(project_); }
+    catch (const std::exception& error) { status_ = "Autosave failed. "+std::string(error.what()); }
+}
+
 void Editor::checkpoint() {
     if (undo_.size() >= 36) undo_.erase(undo_.begin());
     undo_.push_back(project_);
@@ -403,7 +430,10 @@ void Editor::history(bool forward) {
     project_ = std::move(source.back());
     source.pop_back();
     normalizeSelection();
+    revealModel_ = revealAnimation_ = true;
     stageArtworkDrag_.reset();
+    terrainDrag_.reset();
+    terrainPlacement_.reset();
     renameInput_ = project_.characters.empty() ? "" : project_.characters[size_t(model_)].id;
     resetPlayback();
     dirty_ = true;
@@ -421,6 +451,7 @@ void Editor::normalizeSelection() {
         const auto& stage = project_.stages[size_t(stage_)];
         spawn_ = clampIndex(spawn_,stage.spawns.size());
         panel_ = clampIndex(panel_,stage.panels.size());
+        terrain_ = clampIndex(terrain_,stage.terrain.size());
     }
 }
 
@@ -431,9 +462,19 @@ void Editor::resetPlayback(bool play) {
     cueAge_ = itemAge_ = -1.0f;
 }
 
+void Editor::stepFrame(const Animation& animation, int direction) {
+    const int count = int(animation.frames.size());
+    if (!count) return;
+    const int next = frame_+direction;
+    frame_ = animation.loop ? (next+count)%count : std::clamp(next,0,count-1);
+    resetPlayback();
+    revealFrame_ = true;
+}
+
 void Editor::setModel(int index) {
     model_ = index;
     animation_ = frame_ = 0;
+    revealModel_ = revealAnimation_ = true;
     characterSelection_ = EditTool::select;
     paletteIndex_ = 0;
     paletteColor_ = 1;
@@ -445,6 +486,7 @@ void Editor::setModel(int index) {
 void Editor::setAnimation(int index) {
     animation_ = index;
     frame_ = 0;
+    revealAnimation_ = true;
     characterSelection_ = EditTool::select;
     resetPlayback();
 }
@@ -456,7 +498,7 @@ void Editor::insertModel(Character model) {
     const auto old = model.id;
     model.id = id;
     for (auto& animation : model.animations) {
-        if (animation.projectile.model == old && !old.empty()) animation.projectile.model = id;
+        if (animation.subEntity.model == old && !old.empty()) animation.subEntity.model = id;
         if (animation.item.model == old && !old.empty()) animation.item.model = id;
     }
     checkpoint();
@@ -500,13 +542,19 @@ void Editor::newStage() {
     stage_ = int(project_.stages.size())-1;
     spawn_ = panel_ = camera_ = 0;
     stageSelection_ = StageSelection::spawn;
+    stageCameraPreview_ = false;
     stageArtworkDrag_.reset();
+    terrainDrag_.reset();
+    terrainPlacement_.reset();
+    terrain_ = 0;
     stageView_ = {1.0f,{}};
     status_ = "Add a panel image to define the stage.";
 }
 
 void Editor::load(const fs::path& path, bool asSample) {
-    adoptProject(openProject(path),path,asSample);
+    auto next = openProject(path);
+    recovery_.clear();
+    adoptProject(std::move(next),path,asSample);
     status_ = asSample ? "Demo project loaded. Save a copy to keep your changes." : "Opened " + utf8(path.filename());
 }
 
@@ -524,11 +572,17 @@ void Editor::adoptProject(Project next, const fs::path& path, bool asSample) {
     nativeOpen_ = false;
     file_ = asSample ? fs::path{} : path;
     dirty_ = false;
+    nextAutosave_ = std::chrono::steady_clock::now()+Recovery::interval;
     undo_.clear(); redo_.clear();
     model_ = animation_ = frame_ = stage_ = spawn_ = panel_ = camera_ = 0;
+    revealModel_ = revealAnimation_ = true;
     characterSelection_ = EditTool::select;
     stageSelection_ = StageSelection::spawn;
+    stageCameraPreview_ = false;
     stageArtworkDrag_.reset();
+    terrainDrag_.reset();
+    terrainPlacement_.reset();
+    terrain_ = 0;
     characterView_ = {asSample ? 6.0f : 4.0f,{}};
     stageView_ = {asSample ? 1.45f : 1.0f,{}};
     stageMode_ = project_.characters.empty() && !project_.stages.empty();
@@ -540,8 +594,8 @@ void Editor::adoptProject(Project next, const fs::path& path, bool asSample) {
     resetPlayback();
     if (asSample && !project_.characters.empty() && !project_.characters[0].animations.empty()) {
         const auto& clip = project_.characters[0].animations[0];
-        if (clip.projectile.enabled) {
-            frame_ = clampIndex(clip.projectile.frame, clip.frames.size());
+        if (clip.subEntity.enabled) {
+            frame_ = clampIndex(clip.subEntity.frame, clip.frames.size());
             selectSpawnTab_ = true;
         }
     }
@@ -558,6 +612,8 @@ void Editor::save(bool as) {
     meshPreview_.reset();
     file_ = output;
     dirty_ = false;
+    recovery_.clear();
+    nextAutosave_ = std::chrono::steady_clock::now()+Recovery::interval;
     status_ = "Saved " + utf8(output.filename());
 }
 
@@ -573,16 +629,23 @@ void Editor::replace(std::string action) {
 
 void Editor::executeReplace(const std::string& action) {
     if (action == "New") {
+        recovery_.clear();
         project_ = {};
         undo_.clear(); redo_.clear(); images_.clear();
         glb_.reset();
         meshPreview_.reset();
         file_.clear();
         model_ = animation_ = frame_ = stage_ = spawn_ = panel_ = camera_ = 0;
+        revealModel_ = revealAnimation_ = true;
         characterSelection_ = EditTool::select;
         stageSelection_ = StageSelection::spawn;
+        stageCameraPreview_ = false;
         stageArtworkDrag_.reset();
+        terrainDrag_.reset();
+        terrainPlacement_.reset();
+        terrain_ = 0;
         dirty_ = false;
+        nextAutosave_ = std::chrono::steady_clock::now()+Recovery::interval;
         moduleMode_ = false;
         resetPlayback();
         status_ = "Empty project. Add a model or stage.";
@@ -604,6 +667,7 @@ void Editor::executeReplace(const std::string& action) {
         }
         int skipped = 0;
         auto imported = importModule(folder,images_,skipped);
+        recovery_.clear();
         adoptProject(std::move(imported),{},false);
         dirty_ = true;
         playableExport_ = true;
@@ -611,7 +675,10 @@ void Editor::executeReplace(const std::string& action) {
             std::to_string(project_.stages.size())+" stages. Use Native TXT to edit original files.";
         if (skipped) status_ += " "+std::to_string(skipped)+" entries available only in Native TXT.";
     } else if (action == "Demo") load(sample_,true);
-    else if (action == "Close") DestroyWindow(window_);
+    else if (action == "Close") {
+        recovery_.clear();
+        DestroyWindow(window_);
+    }
 }
 
 void Editor::addFrames() {
@@ -842,7 +909,7 @@ void Editor::meshInspector(Character& model, Animation* animation) {
             animation->meshClip = -1;
             if (std::all_of(animation->frames.begin(),animation->frames.end(),[](const Frame& frame) { return frame.image.empty(); })) {
                 animation->frames.clear();
-                animation->projectile.enabled = animation->item.enabled = false;
+                animation->subEntity.enabled = animation->item.enabled = false;
                 frame_ = 0;
             }
             resetPlayback();
@@ -865,14 +932,14 @@ void Editor::meshInspector(Character& model, Animation* animation) {
 }
 
 void Editor::drawMesh(ImDrawList* draw, const MeshSettings& settings, const Animation& animation,
-                      ImVec2 start, ImVec2 size, ImVec2 origin, float zoom) {
+                      ImVec2 start, ImVec2 size, ImVec2 origin, float zoom, size_t frameIndex) {
     const auto& asset = *meshAsset(settings.file);
     const float resolution = std::min({1.f,640/std::max(1.f,size.x),480/std::max(1.f,size.y)});
     const auto pivot = mul(sub(origin,start),resolution);
     const MeshView view{std::max(1,int(std::ceil(size.x*resolution))),std::max(1,int(std::ceil(size.y*resolution))),
                         pivot.x,pivot.y,zoom*resolution,facingLeft_};
     const int denominator = int(animation.frames.size())-!animation.loop;
-    const float phase = denominator > 0 ? float(frame_)/denominator : 0;
+    const float phase = denominator > 0 ? float(frameIndex)/denominator : 0;
     const int clip = animation.meshClip;
     if (clip < 0 || size_t(clip) >= asset.clips().size()) throw std::runtime_error("Choose an existing GLB clip.");
     if (!meshPreview_ || meshPreview_->settings != settings || meshPreview_->view != view ||
@@ -889,7 +956,7 @@ void Editor::tick(Animation& animation) {
     if (itemAge_ >= 0) itemAge_ += dt;
     playbackSeconds_ += dt;
     const auto trigger = [&]() {
-        if (animation.projectile.enabled && frame_ == animation.projectile.frame) cueAge_ = 0;
+        if (animation.subEntity.enabled && frame_ == animation.subEntity.frame) cueAge_ = 0;
         if (animation.item.enabled && frame_ == animation.item.frame) itemAge_ = 0;
     };
     if (playbackSeconds_ == dt) trigger();
@@ -957,7 +1024,21 @@ void Editor::draw() {
         const float height = std::max(340.0f,area.y-30);
         if (moduleMode_) moduleWorkspace(height);
         else if (stageMode_) stageWorkspace(left,height);
-        else characterWorkspace(left,height);
+        else {
+            const auto& io = ImGui::GetIO();
+            if (!project_.characters.empty() && !io.WantTextInput && !io.KeyCtrl && !io.KeyAlt &&
+                !io.KeySuper && !ImGui::IsAnyItemActive() &&
+                ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+                !ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId)) {
+                const auto& clips = project_.characters[size_t(model_)].animations;
+                if (!clips.empty()) {
+                    const int direction = int(ImGui::IsKeyPressed(ImGuiKey_Period,true)) -
+                                          int(ImGui::IsKeyPressed(ImGuiKey_Comma,true));
+                    if (direction) stepFrame(clips[size_t(animation_)],direction);
+                }
+            }
+            characterWorkspace(left,height);
+        }
         drawStatus();
         drawModals();
     } catch (const std::exception& error) {
@@ -1021,6 +1102,13 @@ void Editor::drawHeader() {
     if (ImGui::BeginPopup("Project menu")) {
         if (ImGui::MenuItem("New project","Ctrl+N")) replace("New");
         if (ImGui::MenuItem("Open project","Ctrl+O")) replace("Open");
+        if (ImGui::MenuItem("Recover autosave",nullptr,false,!dirty_)) {
+            try {
+                recoveryOffer_ = recovery_.latest();
+                showRecovery_ = !recoveryOffer_.empty();
+                if (!showRecovery_) status_ = "No earlier autosave is available.";
+            } catch (const std::exception& error) { status_ = error.what(); }
+        }
         if (ImGui::MenuItem("Open OpenBOR PAK…")) replace("Open PAK");
         if (ImGui::MenuItem("Open OpenBOR data folder…")) replace("Open data");
         if (ImGui::MenuItem("Save as","Ctrl+Shift+S")) {
@@ -1070,6 +1158,9 @@ void Editor::drawModals() {
     exportDialog();
     commandsDialog();
     nativeDialog();
+    jumpSimulator();
+    recoveryDialog();
+    playtestDialog();
     if (confirmReplace_) {
         ImGui::OpenPopup("Unsaved project");
         confirmReplace_ = false;
@@ -1118,6 +1209,300 @@ void Editor::drawModals() {
         textDim(status_.c_str());
         ImGui::EndPopup();
     }
+}
+
+void Editor::playtestDialog() {
+    if (showPlaytest_) {
+        ImGui::OpenPopup("Test Play");
+        showPlaytest_ = false;
+    }
+    ImGui::SetNextWindowSize({520,0},ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Test Play",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) return;
+    if (!project_.stages.empty()) ImGui::TextUnformatted(project_.stages[size_t(stage_)].title.c_str());
+    ImGui::Separator();
+    ImGui::BeginDisabled(playtest_.active());
+    if (ImGui::Button(playtest_.engine().empty() ? "Link OpenBOR executable" : "Change OpenBOR executable")) {
+        try {
+            static const COMDLG_FILTERSPEC exe{L"Windows executable",L"*.exe"};
+            const auto path = dialogPath(window_,false,false,false,false,&exe,L"Choose an OpenBOR executable");
+            if (!path.empty()) { playtest_.linkEngine(path); testError_.clear(); }
+        } catch (const std::exception& error) { testError_ = error.what(); }
+    }
+    if (!playtest_.engine().empty()) ImGui::TextWrapped("%s",utf8(playtest_.engine()).c_str());
+    const auto playable = [](const Character& model) { return model.type == "player" && hasFrames(model); };
+    const auto* selected = findCharacter(project_,testPlayer_);
+    if (!selected || !playable(*selected)) {
+        const auto first = std::find_if(project_.characters.begin(),project_.characters.end(),playable);
+        selected = first == project_.characters.end() ? nullptr : &*first;
+        testPlayer_ = selected ? selected->id : "";
+    }
+    ImGui::TextUnformatted("Player character");
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##Test player",selected ? selected->title.c_str() : "Add a player model with frames")) {
+        for (const auto& model : project_.characters) {
+            if (!playable(model)) continue;
+            ImGui::PushID(model.id.c_str());
+            if (ImGui::Selectable(model.title.c_str(),model.id == testPlayer_)) testPlayer_ = model.id;
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (!testError_.empty()) ImGui::TextWrapped("%s",testError_.c_str());
+    ImGui::Spacing();
+    if (playtest_.building()) {
+        ImGui::TextUnformatted("Building the selected stage...");
+    } else if (playtest_.active()) {
+        if (ImGui::Button("Stop test")) playtest_.stop();
+        ImGui::SameLine();
+    } else {
+        ImGui::BeginDisabled(testPlayer_.empty() || playtest_.engine().empty() || project_.stages.empty());
+        if (filled("Play selected stage")) {
+            try {
+                playtest_.start(project_,{size_t(stage_),testPlayer_});
+                testError_.clear();
+                ImGui::CloseCurrentPopup();
+            } catch (const std::exception& error) { testError_ = error.what(); }
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+    }
+    const auto logs = playtest_.logs();
+    if (!logs.empty() && fs::is_directory(logs)) {
+        if (ImGui::Button("Open test logs"))
+            ShellExecuteW(window_,L"open",logs.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+        ImGui::SameLine();
+    }
+    if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void Editor::recoveryDialog() {
+    if (showRecovery_) {
+        recoveryError_.clear();
+        ImGui::OpenPopup("Recover unsaved work");
+        showRecovery_ = false;
+    }
+    if (!ImGui::BeginPopupModal("Recover unsaved work",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) return;
+    ImGui::TextUnformatted("Studio found a recovery snapshot from an earlier session.");
+    if (!recoveryError_.empty()) ImGui::TextWrapped("%s",recoveryError_.c_str());
+    if (filled("Recover latest")) {
+        try {
+            auto recovered = recovery_.restore(recoveryOffer_);
+            adoptProject(std::move(recovered),{},false);
+            dirty_ = true;
+            recoveryOffer_.clear();
+            status_ = "Recovered unsaved work. Use Save to keep it as a project.";
+            ImGui::CloseCurrentPopup();
+        } catch (const std::exception& error) { recoveryError_ = error.what(); }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Skip recovery")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
+void Editor::jumpCanvas(const Character& model, const Animation* animation, size_t frameIndex,
+                        const JumpArc& arc, const JumpPoint& point) {
+    const auto start = ImGui::GetCursorScreenPos();
+    const auto available = ImGui::GetContentRegionAvail();
+    const ImVec2 size{std::max(1.f,available.x),std::max(1.f,available.y)};
+    const auto end = add(start,size);
+    ImGui::Dummy(size);
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->PushClipRect(start,end,true);
+    draw->AddRectFilled(start,end,ImGui::GetColorU32(ImGuiCol_WindowBg),5);
+    const auto& peak = arc.points[arc.apex];
+    const float distance = arc.points.back().x;
+    const float direction = facingLeft_ ? -1.f : 1.f;
+    const float zoom = std::min({5.f,size.x/(std::abs(distance)+104),size.y/(peak.altitude+96)});
+    const auto origin = add(start,{(size.x-distance*direction*zoom)*.5f,size.y-38});
+    const auto at = [&](const JumpPoint& p) {
+        return add(origin,{p.x*direction*zoom,-p.altitude*zoom});
+    };
+    draw->AddLine({start.x+8,origin.y},{end.x-8,origin.y},guideColor,2);
+    draw->AddLine({start.x+8,at(peak).y},{end.x-8,at(peak).y},guideColor);
+    const size_t stride = std::max<size_t>(1,arc.points.size()/450);
+    for (size_t i=0; i+1<arc.points.size(); i+=stride) {
+        const size_t next = std::min(i+stride,arc.points.size()-1);
+        draw->AddLine(at(arc.points[i]),at(arc.points[next]),shotColor,2);
+    }
+    draw->AddCircleFilled(origin,3,dim);
+    draw->AddCircleFilled(at(peak),4,shotColor);
+    if (arc.landed) draw->AddCircleFilled(at(arc.points.back()),4,bodyColor);
+    const auto pivot = at(point);
+    draw->AddCircleFilled({pivot.x,origin.y},6,IM_COL32(103,122,143,105));
+    try {
+        if (animation && animation->meshClip >= 0 && !model.mesh.file.empty()) {
+            drawMesh(draw,model.mesh,*animation,start,size,pivot,zoom,frameIndex);
+        } else if (const auto* frame = animation ? &animation->frames[frameIndex] : previewFrame(&model)) {
+            if (const auto* texture = images_.texture(frame->image)) effectedSprite(draw,*texture,*frame,pivot,zoom,facingLeft_);
+        }
+    } catch (const std::exception& error) {
+        label(draw,add(start,{12,10}),error.what(),attackColor);
+    }
+    cross(draw,pivot,accent);
+    draw->PopClipRect();
+}
+
+void Editor::jumpSimulator() {
+    if (jumpOpen_) {
+        ImGui::OpenPopup("Jump simulator");
+        jumpOpen_ = false;
+    }
+    const auto work = ImGui::GetMainViewport()->WorkSize;
+    ImGui::SetNextWindowSize({std::min(1020.f,work.x-32),std::min(680.f,work.y-32)},ImGuiCond_Appearing);
+    bool open = true;
+    if (!ImGui::BeginPopupModal("Jump simulator",&open)) {
+        jumpPlaying_ = false;
+        return;
+    }
+    if (project_.characters.empty()) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    auto& model = project_.characters[size_t(model_)];
+    const auto jump = [&](const char* title, JumpMode mode) {
+        if (toggleButton(title,jumpMode_ == mode)) {
+            jumpMode_ = mode;
+            jumpTime_ = 0;
+            jumpPlaying_ = false;
+        }
+    };
+    jump("Standing",JumpMode::standing);
+    ImGui::SameLine();
+    jump("Forward",JumpMode::forward);
+    ImGui::SameLine();
+    jump("Running",JumpMode::running);
+    ImGui::SameLine();
+    if (ImGui::Button(facingLeft_ ? "Facing left" : "Facing right")) facingLeft_ = !facingLeft_;
+
+    const float height = std::max(120.f,ImGui::GetContentRegionAvail().y-40);
+    constexpr float sidebar = 256;
+    const float canvasWidth = std::max(1.f,ImGui::GetContentRegionAvail().x-sidebar-ImGui::GetStyle().ItemSpacing.x);
+    child("Jump settings",{sidebar,height});
+    section("Character settings");
+    if (jumpStage_ >= int(project_.stages.size())) jumpStage_ = -1;
+    const auto* stage = jumpStage_ < 0 ? nullptr : &project_.stages[size_t(jumpStage_)];
+    JumpSettings settings;
+    try {
+        settings = jumpSettings(project_,model,stage);
+    } catch (const std::exception& error) {
+        ImGui::TextWrapped("%s",error.what());
+    }
+    const bool nativeOverride = project_.nativeEdits.contains(model.nativeFile);
+    ImGui::BeginDisabled(nativeOverride);
+    const auto tune = [&](const char* name, float& value, float maximum) {
+        ImGui::PushID(name);
+        ImGui::TextUnformatted(name);
+        ImGui::SetNextItemWidth(-1);
+        auto next = value;
+        if (numberFields<float>("##Value",{{next,-1,maximum}},.1f,"%.2f")) {
+            checkpoint();
+            value = next < 0 ? -1.f : next;
+        }
+        ImGui::PopID();
+    };
+    if (jumpMode_ == JumpMode::running) {
+        tune("Running jump height",model.entity.runningJumpHeight,100);
+        tune("Running distance multiplier",model.entity.runningJumpDistance,20);
+    } else {
+        tune("Jump height",model.entity.jumpHeight,100);
+    }
+    if (jumpMode_ != JumpMode::standing) tune("Forward jump speed",model.entity.jumpSpeed,100);
+    ImGui::EndDisabled();
+    if (nativeOverride) ImGui::TextWrapped("This model uses a Native TXT override. Edit its jump settings there.");
+    else textDim("-1 uses the engine or module default.");
+    if (jumpMode_ == JumpMode::running)
+        ImGui::Text("Running launch  %.2f Y  /  %.2f X",
+                    settings.runningHeight,settings.speed*settings.runningDistance);
+    else if (jumpMode_ == JumpMode::standing)
+        ImGui::Text("Effective launch  %.2f Y",settings.height);
+    else
+        ImGui::Text("Effective launch  %.2f Y  /  %.2f X",settings.height,settings.speed);
+
+    ImGui::Separator();
+    section("Preview floor");
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##Jump stage",stage ? stage->title.c_str() : "Module defaults")) {
+        if (ImGui::Selectable("Module defaults",jumpStage_ < 0)) jumpStage_ = -1;
+        for (size_t i=0; i<project_.stages.size(); ++i) {
+            ImGui::PushID(int(i));
+            if (ImGui::Selectable(project_.stages[i].title.c_str(),jumpStage_ == int(i))) jumpStage_ = int(i);
+            ImGui::PopID();
+        }
+        ImGui::EndCombo();
+    }
+    bool overrideGravity = jumpGravity_.has_value();
+    if (ImGui::Checkbox("Preview gravity override",&overrideGravity)) {
+        if (overrideGravity) jumpGravity_ = settings.gravity;
+        else jumpGravity_.reset();
+    }
+    if (jumpGravity_) {
+        ImGui::SetNextItemWidth(-1);
+        numberFields<float>("##Preview gravity",{{*jumpGravity_,-10,10}},.01f,"%.3f");
+        settings.gravity = *jumpGravity_;
+    } else {
+        ImGui::Text("Gravity  %.3f",settings.gravity);
+    }
+    textDim("Flat ground preview");
+    ImGui::EndChild();
+    ImGui::SameLine();
+
+    const auto* airborne = jumpAnimation(model,jumpMode_);
+    const auto* takeoff = jumpClip(model,"jumpdelay");
+    const auto* landing = jumpClip(model,"jumpland");
+    const auto arc = simulateJump(settings,jumpMode_);
+    const float before = jumpClipSeconds(takeoff);
+    const float duration = before+arc.seconds+(arc.landed ? jumpClipSeconds(landing) : 0);
+    jumpTime_ = std::clamp(jumpTime_,0.f,duration);
+    if (jumpPlaying_) {
+        jumpTime_ = std::min(duration,jumpTime_+std::min(.1f,ImGui::GetIO().DeltaTime)*playbackSpeed_);
+        if (jumpTime_ == duration) jumpPlaying_ = false;
+    }
+    child("Jump arc",{canvasWidth,height},ImGuiWindowFlags_NoScrollbar);
+    ImGui::BeginDisabled(duration <= 0);
+    if (toggleButton(jumpPlaying_ ? "Pause" : "Play jump",jumpPlaying_,{94,0})) {
+        if (!jumpPlaying_ && jumpTime_ == duration) jumpTime_ = 0;
+        jumpPlaying_ = !jumpPlaying_;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Apex")) {
+        jumpTime_ = before+float(arc.apex)/settings.ticksPerSecond;
+        jumpPlaying_ = false;
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderFloat("##Jump time",&jumpTime_,0,duration,"%.2f s")) jumpPlaying_ = false;
+    ImGui::EndDisabled();
+
+    const float flightTime = std::clamp(jumpTime_-before,0.f,arc.seconds);
+    const float step = flightTime*settings.ticksPerSecond;
+    const auto tick = std::min(size_t(step),arc.points.size()-1);
+    const auto& from = arc.points[tick];
+    const auto& to = arc.points[std::min(tick+1,arc.points.size()-1)];
+    const float blend = step-float(tick);
+    const JumpPoint point{std::lerp(from.x,to.x,blend),std::lerp(from.altitude,to.altitude,blend)};
+    const Animation* clip = airborne;
+    float clipTime = flightTime;
+    if (jumpTime_ < before) {
+        clip = takeoff;
+        clipTime = jumpTime_;
+    } else if (arc.landed && jumpTime_ >= before+arc.seconds && landing) {
+        clip = landing;
+        clipTime = jumpTime_-before-arc.seconds;
+    }
+    const size_t pose = clip ? jumpClipFrame(*clip,clipTime) : 0;
+    if (clip) ImGui::Text("%s  /  Frame %02zu",clip->name.c_str(),pose);
+    else ImGui::TextUnformatted("Add a Jump animation to preview its frames.");
+    if (arc.landed)
+        ImGui::Text("Apex %.1f px   |   Travel %.1f px   |   Air time %.2f s",
+                    arc.points[arc.apex].altitude,std::abs(arc.points.back().x),arc.seconds);
+    else ImGui::TextUnformatted(arc.seconds > 0 ? "No landing within 12 seconds" : "No upward launch velocity");
+    jumpCanvas(model,clip,pose,arc,point);
+    ImGui::EndChild();
+    if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
 }
 
 std::string* Editor::commandText(Project& project, CommandContext context) const {
@@ -1387,15 +1772,31 @@ void Editor::exportDialog() {
     if (showExport_) {
         ImGui::OpenPopup("Export OpenBOR");
         showExport_ = false;
+        exportTarget_.clear();
     }
     ImGui::SetNextWindowSize({530,0},ImGuiCond_Appearing);
     if (!ImGui::BeginPopupModal("Export OpenBOR",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) return;
     if (exportedTo_.empty()) {
-        if (ImGui::RadioButton("Playable module",playableExport_)) playableExport_ = true;
-        ImGui::SameLine();
-        if (ImGui::RadioButton(project_.nativeFiles.empty() ? "Content for an existing module" : "Editable data folder",
-                               !playableExport_)) playableExport_ = false;
-        if (!project_.nativeFiles.empty()) {
+        constexpr const char* destinations[]{"New export folder","Replace an existing PAK","Update an existing data folder"};
+        ImGui::SetNextItemWidth(-1);
+        int mode = int(exportDestination_);
+        ImGui::BeginDisabled(!exportTarget_.empty());
+        if (ImGui::Combo("##Export destination",&mode,destinations,IM_ARRAYSIZE(destinations))) {
+            exportDestination_ = ExportDestination(mode);
+            exportError_.clear();
+        }
+        if (exportDestination_ == ExportDestination::newFolder) {
+            if (ImGui::RadioButton("Playable module",playableExport_)) playableExport_ = true;
+            ImGui::SameLine();
+            if (ImGui::RadioButton(project_.nativeFiles.empty() ? "Content for an existing module" : "Editable data folder",
+                                   !playableExport_)) playableExport_ = false;
+        }
+        ImGui::EndDisabled();
+        if (exportDestination_ == ExportDestination::existingPak) {
+            ImGui::TextWrapped("Replaces the selected PAK with a complete export of this project.");
+        } else if (exportDestination_ == ExportDestination::existingData) {
+            ImGui::TextWrapped("Overwrites matching files in the selected data folder and keeps files outside the export.");
+        } else if (!project_.nativeFiles.empty()) {
             ImGui::TextWrapped("%s",playableExport_ ? "Creates a PAK and a copy of the complete data folder." :
                                                     "Exports a copy of the complete data folder.");
             ImGui::TextWrapped("Frame sounds and stage music update native commands in place. Other visual model or stage edits can regenerate the corresponding TXT.");
@@ -1413,25 +1814,45 @@ void Editor::exportDialog() {
             ImGui::PopStyleColor();
         }
         ImGui::Spacing();
-        if (filled("Choose folder and export")) {
-            try {
-                verifyProject(project_);
-                const auto parent = dialogPath(window_,true,false);
-                if (!parent.empty()) {
-                    exportedTo_ = exportProject(project_,parent,images_,playableExport_);
-                    status_ = "Exported to " + utf8(exportedTo_);
-                    exportError_.clear();
-                }
-            } catch (const std::exception& error) {
-                exportError_ = error.what();
-                status_ = exportError_;
+        const auto runExport = [&](const fs::path& target) {
+            exportedTo_ = exportProject(project_,target,images_,playableExport_,exportDestination_);
+            status_ = "Exported to " + utf8(exportedTo_);
+            exportError_.clear();
+            exportTarget_.clear();
+        };
+        const auto report = [&](const std::exception& error) {
+            exportError_ = error.what();
+            status_ = exportError_;
+        };
+        if (!exportTarget_.empty()) {
+            ImGui::TextWrapped("%s",utf8(exportTarget_).c_str());
+            if (filled(exportDestination_ == ExportDestination::existingPak ? "Replace PAK" : "Update data folder")) {
+                try { runExport(exportTarget_); }
+                catch (const std::exception& error) { report(error); }
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Choose another")) exportTarget_.clear();
+        } else if (filled(exportDestination_ == ExportDestination::newFolder ? "Choose folder and export" :
+                         exportDestination_ == ExportDestination::existingPak ? "Choose PAK" : "Choose data folder")) {
+            try {
+                if (exportDestination_ == ExportDestination::existingPak) {
+                    static const COMDLG_FILTERSPEC pak{L"OpenBOR PAK",L"*.pak"};
+                    exportTarget_ = dialogPath(window_,false,false,false,false,&pak,L"Choose the PAK to replace");
+                } else {
+                    const auto folder = dialogPath(window_,true,false);
+                    if (!folder.empty()) {
+                        if (exportDestination_ == ExportDestination::newFolder) runExport(folder);
+                        else exportTarget_ = existingExportData(folder);
+                    }
+                }
+            } catch (const std::exception& error) { report(error); }
         }
     } else {
         ImGui::TextUnformatted("Export complete");
         ImGui::TextWrapped("%s",utf8(exportedTo_).c_str());
         if (filled("Open export folder")) {
-            if (reinterpret_cast<INT_PTR>(ShellExecuteW(window_,L"open",exportedTo_.c_str(),
+            const auto folder = exportDestination_ == ExportDestination::existingPak ? exportedTo_.parent_path() : exportedTo_;
+            if (reinterpret_cast<INT_PTR>(ShellExecuteW(window_,L"open",folder.c_str(),
                                                        nullptr,nullptr,SW_SHOWNORMAL)) <= 32)
                 status_ = "Could not open the export folder.";
         }
@@ -2021,9 +2442,16 @@ void Editor::layoutEditor(bool select, float height) {
 }
 
 void Editor::characterWorkspace(float left, float height) {
-    child("Character library",{left,height});
+    const float sidebarHeight = height-ImGui::GetStyle().ItemSpacing.y;
+    const float modelsHeight = std::clamp(sidebarHeight*.60f,215.f,sidebarHeight-100.f);
+    ImGui::BeginGroup();
+    child("Models panel",{left,modelsHeight},ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     characterLibrary();
     ImGui::EndChild();
+    child("Animations panel",{left,sidebarHeight-modelsHeight},ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    animationLibrary();
+    ImGui::EndChild();
+    ImGui::EndGroup();
     ImGui::SameLine();
     const auto layout = inspectorLayout();
     Character* model = project_.characters.empty() ? nullptr : &project_.characters[size_t(model_)];
@@ -2057,35 +2485,64 @@ void Editor::characterLibrary() {
         try { importGlb(); } catch (const std::exception& error) { status_ = error.what(); }
     }
     ImGui::Spacing();
-    for (size_t i = 0; i < project_.characters.size(); ++i) {
-        const auto& model = project_.characters[i];
-        ImGui::PushID(int(i));
-        const auto start = ImGui::GetCursorScreenPos();
-        const bool selected = model_ == int(i);
-        if (ImGui::Selectable("##Model",selected,0,{0,42})) setModel(int(i));
-        auto* draw = ImGui::GetWindowDrawList();
-        draw->AddRectFilled(add(start,{3,3}),add(start,{40,39}),IM_COL32(25,35,51,255),4);
-        if (const auto frame = previewFrame(&model)) thumbnail(draw,images_.texture(frame->image),add(start,{5,4}),{33,33});
-        if (selected) draw->AddRectFilled(start,add(start,{2,42}),accent,1);
-        draw->AddText(add(start,{48,3}),ink,model.title.c_str());
-        draw->AddText(add(start,{48,22}),dim,model.type.c_str());
-        ImGui::PopID();
+    if (ImGui::BeginChild("Model list",{0,0})) {
+        ImGuiListClipper rows;
+        rows.Begin(int(project_.characters.size()));
+        if (revealModel_ && !project_.characters.empty()) rows.IncludeItemByIndex(model_);
+        while (rows.Step()) {
+            for (int i=rows.DisplayStart; i<rows.DisplayEnd; ++i) {
+                const auto& model = project_.characters[size_t(i)];
+                ImGui::PushID(i);
+                const auto start = ImGui::GetCursorScreenPos();
+                const bool selected = model_ == i;
+                if (ImGui::Selectable("##Model",selected,0,{0,42})) setModel(i);
+                if (selected && revealModel_ && !ImGui::IsItemVisible()) ImGui::SetScrollHereY();
+                if (ImGui::IsItemVisible()) {
+                    auto* draw = ImGui::GetWindowDrawList();
+                    draw->AddRectFilled(add(start,{3,3}),add(start,{40,39}),IM_COL32(25,35,51,255),4);
+                    if (const auto frame = previewFrame(&model))
+                        thumbnail(draw,images_.texture(frame->image),add(start,{5,4}),{33,33});
+                    if (selected) draw->AddRectFilled(start,add(start,{2,42}),accent,1);
+                    draw->AddText(add(start,{48,3}),ink,model.title.c_str());
+                    draw->AddText(add(start,{48,22}),dim,model.type.c_str());
+                }
+                ImGui::PopID();
+            }
+        }
+        revealModel_ = false;
     }
-    if (project_.characters.empty()) return;
-    ImGui::Separator();
-    section("Animations");
-    if (ImGui::Button("+ Animation",{-1,27})) addAnimation();
-    auto& model = project_.characters[size_t(model_)];
-    for (size_t i = 0; i < model.animations.size(); ++i) {
-        auto& animation = model.animations[i];
-        ImGui::PushID(int(i));
-        const std::string caption = animation.name + "  (" + std::to_string(animation.frames.size()) + ")";
-        if (ImGui::Selectable(caption.c_str(),animation_ == int(i),0,{0,25})) setAnimation(int(i));
-        ImGui::PopID();
-    }
+    ImGui::EndChild();
 }
 
-void Editor::drawCue(SpawnCue& cue, const char* title, bool projectile, Animation& animation) {
+void Editor::animationLibrary() {
+    section("Animations");
+    if (project_.characters.empty()) {
+        textDim("Select or create a model.");
+        return;
+    }
+    if (ImGui::Button("+ Animation",{-1,27})) addAnimation();
+    const auto& animations = project_.characters[size_t(model_)].animations;
+    if (ImGui::BeginChild("Animation list",{0,0})) {
+        ImGuiListClipper rows;
+        rows.Begin(int(animations.size()));
+        if (revealAnimation_ && !animations.empty()) rows.IncludeItemByIndex(animation_);
+        while (rows.Step()) {
+            for (int i=rows.DisplayStart; i<rows.DisplayEnd; ++i) {
+                const auto& animation = animations[size_t(i)];
+                ImGui::PushID(i);
+                const auto caption = animation.name + "  (" + std::to_string(animation.frames.size()) + ")";
+                const bool selected = animation_ == i;
+                if (ImGui::Selectable(caption.c_str(),selected,0,{0,25})) setAnimation(i);
+                if (selected && revealAnimation_ && !ImGui::IsItemVisible()) ImGui::SetScrollHereY();
+                ImGui::PopID();
+            }
+        }
+        revealAnimation_ = false;
+    }
+    ImGui::EndChild();
+}
+
+void Editor::drawCue(SpawnCue& cue, const char* title, EditTool mode, Animation& animation) {
     ImGui::PushID(title);
     const bool old = cue.enabled;
     bool enabled = old;
@@ -2096,7 +2553,8 @@ void Editor::drawCue(SpawnCue& cue, const char* title, bool projectile, Animatio
             cue.frame = frame_;
             if (cue.model.empty()) {
                 for (const auto& model : project_.characters) {
-                    if (model.type == (projectile ? "projectile" : "item")) {
+                    if (mode == EditTool::item ? model.type == "item" :
+                        (model.type == "projectile" || model.type == "shot")) {
                         cue.model = model.id;
                         break;
                     }
@@ -2120,13 +2578,6 @@ void Editor::drawCue(SpawnCue& cue, const char* title, bool projectile, Animatio
         ImGui::SetNextItemWidth(-1);
         if (numberFields<int>("##Position",{{cue.x,-2048,2048},{cue.z,-2048,2048},
                                              {cue.altitude,-2048,2048}})) dirty_ = true;
-        if (projectile) {
-            ImGui::TextUnformatted("Velocity X / Z / Y");
-            ImGui::SetNextItemWidth(-1);
-            if (numberFields<float>("##Velocity",{{cue.velocityX,-50,50},{cue.velocityZ,-50,50},
-                                                    {cue.velocityY,-50,50}},.05f,"%.2f")) dirty_ = true;
-        }
-        const auto mode = projectile ? EditTool::projectile : EditTool::item;
         if (toggleButton("Place in preview",tool_ == mode,{-1,25})) {
             tool_ = mode;
             frame_ = clampIndex(cue.frame,animation.frames.size());
@@ -2308,6 +2759,72 @@ void Editor::entityEditor(Character& model) {
 void Editor::frameInspector(Character& model, Animation* animation) {
     section("Inspector");
     if (ImGui::BeginTabBar("Model settings",inspectorTabs)) {
+        if (ImGui::BeginTabItem("Entity")) {
+            ImGui::TextUnformatted("Display name");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::InputText("##Title",&model.title)) dirty_ = true;
+            ImGui::TextUnformatted("OpenBOR model ID");
+            ImGui::SetNextItemWidth(-72);
+            ImGui::InputText("##ID",&renameInput_);
+            ImGui::SameLine();
+            if (ImGui::Button("Apply")) {
+                try {
+                    checkpoint();
+                    renameCharacter(project_,size_t(model_),renameInput_);
+                    renameInput_ = model.id;
+                } catch (const std::exception& error) { status_ = error.what(); }
+            }
+            ImGui::TextUnformatted("Type");
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##Type",model.type.c_str())) {
+                for (const char* type : {"player","enemy","npc","item","projectile","obstacle","none","shot"}) {
+                    if (ImGui::Selectable(type,model.type == type) && model.type != type) {
+                        checkpoint(); model.type = type;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SetNextItemWidth(-85);
+            if (numberFields<int>("Health",{{model.health,1,100000}})) dirty_ = true;
+            ImGui::SetNextItemWidth(-85);
+            if (numberFields<float>("Speed",{{model.speed,0,50}},.05f,"%.2f")) dirty_ = true;
+            entityEditor(model);
+            if (animation) {
+                ImGui::Separator();
+                section("Selected animation");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText("##Animation ID",&animation->name)) dirty_ = true;
+                if (ImGui::Checkbox("Loop",&animation->loop)) dirty_ = true;
+                if (ImGui::Button("Edit animation commands",{-1,26})) openCommands(CommandContext::animation);
+            }
+            if (ImGui::Button("Edit / preview model TXT",{-1,30})) openCommands(CommandContext::model);
+            if (animation && ImGui::Button("Remove animation",{-1,27})) {
+                checkpoint();
+                model.animations.erase(model.animations.begin()+animation_);
+                setAnimation(clampIndex(animation_,model.animations.size()));
+                animation = model.animations.empty() ? nullptr : &model.animations[size_t(animation_)];
+            }
+            if (ImGui::Button("Remove model",{-1,27})) {
+                checkpoint();
+                const auto id = model.id;
+                project_.characters.erase(project_.characters.begin()+model_);
+                for (auto& other : project_.characters) {
+                    for (auto& clip : other.animations) {
+                        if (clip.subEntity.model == id) clip.subEntity = {};
+                        if (clip.item.model == id) clip.item = {};
+                    }
+                }
+                for (auto& stage : project_.stages) {
+                    std::erase_if(stage.spawns,[&](const StageSpawn& spawn){return spawn.model == id;});
+                    for (auto& spawn : stage.spawns) if (spawn.item == id) spawn.item.clear();
+                }
+                setModel(clampIndex(model_,project_.characters.size()));
+                ImGui::EndTabItem();
+                ImGui::EndTabBar();
+                return;
+            }
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Frame")) {
             if (animation && !animation->frames.empty()) {
                 auto& frame = animation->frames[size_t(frame_)];
@@ -2382,74 +2899,12 @@ void Editor::frameInspector(Character& model, Animation* animation) {
         if (ImGui::BeginTabItem("Spawns",nullptr,selectSpawnTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
             if (animation && !animation->frames.empty()) {
                 selectSpawnTab_ = false;
-                drawCue(animation->projectile,"Projectile cue",true,*animation);
+                drawCue(animation->subEntity,"Sub Entity cue",EditTool::subEntity,*animation);
                 ImGui::Separator();
-                drawCue(animation->item,"Item spawn cue",false,*animation);
+                drawCue(animation->item,"Item spawn cue",EditTool::item,*animation);
                 ImGui::Spacing();
-                ImGui::TextWrapped("X flips with facing. Altitude moves the marker up; Z moves it down.");
+                ImGui::TextWrapped("Placement follows the parent and its facing. Set movement and attacks on the spawned model.");
             } else textDim("Add a frame to place a spawn cue.");
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Entity")) {
-            ImGui::TextUnformatted("Display name");
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::InputText("##Title",&model.title)) dirty_ = true;
-            ImGui::TextUnformatted("OpenBOR model ID");
-            ImGui::SetNextItemWidth(-72);
-            ImGui::InputText("##ID",&renameInput_);
-            ImGui::SameLine();
-            if (ImGui::Button("Apply")) {
-                try {
-                    checkpoint();
-                    renameCharacter(project_,size_t(model_),renameInput_);
-                    renameInput_ = model.id;
-                } catch (const std::exception& error) { status_ = error.what(); }
-            }
-            ImGui::TextUnformatted("Type");
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##Type",model.type.c_str())) {
-                for (const char* type : {"player","enemy","npc","item","projectile","obstacle","none","shot"}) {
-                    if (ImGui::Selectable(type,model.type == type) && model.type != type) {
-                        checkpoint(); model.type = type;
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            ImGui::SetNextItemWidth(-85);
-            if (numberFields<int>("Health",{{model.health,1,100000}})) dirty_ = true;
-            ImGui::SetNextItemWidth(-85);
-            if (numberFields<float>("Speed",{{model.speed,0,50}},.05f,"%.2f")) dirty_ = true;
-            entityEditor(model);
-            if (animation) {
-                ImGui::Separator();
-                section("Selected animation");
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::InputText("##Animation ID",&animation->name)) dirty_ = true;
-                if (ImGui::Checkbox("Loop",&animation->loop)) dirty_ = true;
-                if (ImGui::Button("Edit animation commands",{-1,26})) openCommands(CommandContext::animation);
-            }
-            if (ImGui::Button("Edit / preview model TXT",{-1,30})) openCommands(CommandContext::model);
-            if (animation && ImGui::Button("Remove animation",{-1,27})) {
-                checkpoint();
-                model.animations.erase(model.animations.begin()+animation_);
-                setAnimation(clampIndex(animation_,model.animations.size()));
-            }
-            if (ImGui::Button("Remove model",{-1,27})) {
-                checkpoint();
-                const auto id = model.id;
-                project_.characters.erase(project_.characters.begin()+model_);
-                for (auto& other : project_.characters) {
-                    for (auto& clip : other.animations) {
-                        if (clip.projectile.model == id) clip.projectile = {};
-                        if (clip.item.model == id) clip.item = {};
-                    }
-                }
-                for (auto& stage : project_.stages) {
-                    std::erase_if(stage.spawns,[&](const StageSpawn& spawn){return spawn.model == id;});
-                    for (auto& spawn : stage.spawns) if (spawn.item == id) spawn.item.clear();
-                }
-                setModel(clampIndex(model_,project_.characters.size()));
-            }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Effects")) {
@@ -2493,7 +2948,7 @@ void Editor::characterCanvas(Animation* animation, float height) {
 
     static const std::array<std::pair<const char*,EditTool>,6> tools{{
         {"Select",EditTool::select},{"Origin",EditTool::origin},{"Body",EditTool::body},
-        {"Attack",EditTool::attack},{"Shot",EditTool::projectile},{"Item",EditTool::item}}};
+        {"Attack",EditTool::attack},{"Sub Entity",EditTool::subEntity},{"Item",EditTool::item}}};
     for (size_t i = 0; i < tools.size(); ++i) {
         if (i) ImGui::SameLine(0,5);
         const auto [name,mode] = tools[i];
@@ -2505,6 +2960,18 @@ void Editor::characterCanvas(Animation* animation, float height) {
     if (ImGui::GetContentRegionAvail().x > 92) {
         ImGui::SameLine();
         ImGui::Checkbox("Grid",&showGrid_);
+    }
+    if (!project_.characters.empty()) {
+        if (ImGui::GetContentRegionAvail().x > ImGui::CalcTextSize("Jump simulator").x + ImGui::GetStyle().FramePadding.x*2)
+            ImGui::SameLine(0,5);
+        if (ImGui::Button("Jump simulator")) {
+            resetPlayback();
+            jumpTime_ = 0;
+            jumpPlaying_ = false;
+            jumpOpen_ = true;
+            if (available && animationId(animation->name) == "runjump") jumpMode_ = JumpMode::running;
+            if (available && animationId(animation->name) == "forwardjump") jumpMode_ = JumpMode::forward;
+        }
     }
     if (tool_ == EditTool::origin) {
         if (toggleButton("Place pivot",originMode_ == OriginMode::placePivot)) {
@@ -2556,9 +3023,10 @@ void Editor::characterCanvas(Animation* animation, float height) {
     };
     auto& current = animation->frames[size_t(frame_)];
     const bool hasSprite = images_.texture(current.image) != nullptr || (mapped && current.image.empty());
-    const bool canNudge = (selected == EditTool::body && current.body.enabled && hasSprite) ||
+    const bool nudgeSprite = selected == EditTool::select && tool_ == EditTool::select && hasSprite;
+    const bool canNudge = nudgeSprite || (selected == EditTool::body && current.body.enabled && hasSprite) ||
                           (selected == EditTool::attack && current.attack.enabled && hasSprite) ||
-                          (selected == EditTool::projectile && animation->projectile.enabled) ||
+                          (selected == EditTool::subEntity && animation->subEntity.enabled) ||
                           (selected == EditTool::item && animation->item.enabled) ||
                           ((selected == EditTool::origin || selected == EditTool::sprite) && hasSprite);
     if (const auto [dx,dy] = viewerNudge(canNudge && !spriteDrag_ && !dragging_); dx || dy) {
@@ -2566,11 +3034,11 @@ void Editor::characterCanvas(Animation* animation, float height) {
         if (selected == EditTool::body || selected == EditTool::attack) {
             auto& box = selected == EditTool::body ? current.body : current.attack;
             nudgePosition({box.x,-4096,4096},{box.y,-4096,4096},sign*dx,dy,beforeMove);
-        } else if (selected == EditTool::projectile || selected == EditTool::item) {
-            auto& cue = selected == EditTool::projectile ? animation->projectile : animation->item;
+        } else if (selected == EditTool::subEntity || selected == EditTool::item) {
+            auto& cue = selected == EditTool::subEntity ? animation->subEntity : animation->item;
             nudgePosition({cue.x,-2048,2048},{cue.altitude,-2048,2048},sign*dx,-dy,beforeMove);
         } else {
-            const auto direction = selected == EditTool::sprite ? -1 : 1;
+            const auto direction = selected == EditTool::sprite || nudgeSprite ? -1 : 1;
             nudgePosition({current.originX,-4096,4096},{current.originY,-4096,4096},
                           sign*dx*direction,dy*direction,beforeMove);
         }
@@ -2599,8 +3067,8 @@ void Editor::characterCanvas(Animation* animation, float height) {
         };
         if (animation->item.enabled && nearMarker(io.MousePos,cuePoint(animation->item),11))
             selected = EditTool::item;
-        else if (animation->projectile.enabled && nearMarker(io.MousePos,cuePoint(animation->projectile),11))
-            selected = EditTool::projectile;
+        else if (animation->subEntity.enabled && nearMarker(io.MousePos,cuePoint(animation->subEntity),11))
+            selected = EditTool::subEntity;
         else if (frameBounds && nearMarker(io.MousePos,origin,8)) selected = EditTool::origin;
         else if (inside(frame.attack)) selected = EditTool::attack;
         else if (inside(frame.body)) selected = EditTool::body;
@@ -2612,17 +3080,21 @@ void Editor::characterCanvas(Animation* animation, float height) {
     }
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && tool_ != EditTool::select) {
         resetPlayback();
-        if (tool_ == EditTool::projectile || tool_ == EditTool::item) {
-            auto& cue = tool_ == EditTool::projectile ? animation->projectile : animation->item;
+        if (tool_ == EditTool::subEntity || tool_ == EditTool::item) {
+            auto& cue = tool_ == EditTool::subEntity ? animation->subEntity : animation->item;
             checkpoint();
             const bool first = !cue.enabled;
             cue.enabled = true;
             if (first) {
                 cue.frame = frame_;
-                const char* type = tool_ == EditTool::projectile ? "projectile" : "item";
-                const auto it = std::find_if(project_.characters.begin(),project_.characters.end(),
-                    [&](const Character& c){return c.type == type;});
-                if (it != project_.characters.end()) cue.model = it->id;
+                if (cue.model.empty()) {
+                    const auto it = std::find_if(project_.characters.begin(),project_.characters.end(),
+                        [&](const Character& c) {
+                            return tool_ == EditTool::item ? c.type == "item" :
+                                (c.type == "projectile" || c.type == "shot");
+                        });
+                    if (it != project_.characters.end()) cue.model = it->id;
+                }
             }
             cue.x = int(std::lround((io.MousePos.x-origin.x)*sign/view.zoom));
             cue.altitude = cue.z-int(std::lround((io.MousePos.y-origin.y)/view.zoom));
@@ -2677,7 +3149,7 @@ void Editor::characterCanvas(Animation* animation, float height) {
             sprite(draw,images_,*previous,origin,view.zoom,facingLeft_,IM_COL32(183,171,255,115));
     }
     if (mapped) {
-        try { drawMesh(draw,model.mesh,*animation,start,size,origin,view.zoom); }
+        try { drawMesh(draw,model.mesh,*animation,start,size,origin,view.zoom,size_t(frame_)); }
         catch (const std::exception& error) { label(draw,add(start,{18,20}),error.what(),attackColor); }
     } else if (tex) {
         const Texture* visible = tex;
@@ -2707,43 +3179,38 @@ void Editor::characterCanvas(Animation* animation, float height) {
     rect(frame.body,bodyColor,selected == EditTool::body);
     rect(frame.attack,attackColor,selected == EditTool::attack);
     cross(draw,origin,accent,selected == EditTool::origin ? 8.0f : 5.0f);
-    const auto drawSpawn = [&](const SpawnCue& cue, bool projectile, float age) {
+    const auto drawSpawn = [&](const SpawnCue& cue, EditTool mode, float age) {
         if (!cue.enabled) return;
-        const auto color = projectile ? shotColor : itemColor;
+        const bool item = mode == EditTool::item;
+        const auto color = item ? itemColor : shotColor;
         const bool current = cue.frame == frame_;
         const auto at = cuePoint(cue);
         const auto ground = add(origin,{cue.x*sign*view.zoom,cue.z*view.zoom});
         draw->AddLine(origin,ground,(color&0xffffff)|0x58000000,1);
         draw->AddLine(ground,at,(color&0xffffff)|0x90000000,1);
-        if (projectile) {
-            const auto velocity = ImVec2{cue.velocityX*sign,cue.velocityZ-cue.velocityY};
-            draw->AddLine(at,add(at,mul(velocity,view.zoom*13)),(color&0xffffff)|0x94000000,2);
-        }
         if (showGhost_ && (current || age >= 0)) {
             const auto* child = previewFrame(findCharacter(project_,cue.model));
             if (child) {
-                const float travel = projectile && age > 0 ? std::min(age,.75f)*45.0f : 0;
-                const auto velocity = ImVec2{cue.velocityX*sign,cue.velocityZ-cue.velocityY};
-                sprite(draw,images_,*child,add(at,mul(velocity,travel*view.zoom)),view.zoom,facingLeft_,
+                sprite(draw,images_,*child,at,view.zoom,facingLeft_,
                        current ? IM_COL32(255,255,255,175) : IM_COL32(255,255,255,140));
             }
         }
         cross(draw,at,current ? color : (color&0xffffff)|0x85000000);
-        if (selected == (projectile ? EditTool::projectile : EditTool::item))
+        if (selected == mode)
             draw->AddCircle(at,12,accent,24,1.5f);
-        const auto caption = std::string(projectile ? "Projectile" : "Item") + "  F" + std::to_string(cue.frame);
-        label(draw,add(at,{11,projectile ? -24.0f : 10.0f}),caption.c_str(),color);
+        const auto caption = std::string(item ? "Item" : "Sub Entity") + "  F" + std::to_string(cue.frame);
+        label(draw,add(at,{11,item ? 10.0f : -24.0f}),caption.c_str(),color);
     };
-    drawSpawn(animation->projectile,true,cueAge_);
-    drawSpawn(animation->item,false,itemAge_);
+    drawSpawn(animation->subEntity,EditTool::subEntity,cueAge_);
+    drawSpawn(animation->item,EditTool::item,itemAge_);
 
     const auto scale = std::to_string(int(std::lround(view.zoom*100))) + "%";
     label(draw,{start.x+13,end.y-28},scale.c_str(),dim);
     const char* hint = dragSprite ? "Drag sprite  |  Arrow keys nudge" :
         tool_==EditTool::origin ? "Click to place pivot  |  Arrow keys nudge" :
         tool_==EditTool::body || tool_==EditTool::attack ? "Drag to draw box  |  Arrow keys nudge" :
-        tool_==EditTool::projectile || tool_==EditTool::item ? "Click to place spawn  |  Arrow keys nudge" :
-        selected != EditTool::select ? "Arrow keys nudge selection" : "Click to select  |  Wheel zoom";
+        tool_==EditTool::subEntity || tool_==EditTool::item ? "Click to place spawn  |  Arrow keys nudge" :
+        selected != EditTool::select ? "Arrow keys nudge selection" : "Arrow keys nudge sprite  |  Wheel zoom";
     label(draw,{end.x-ImGui::CalcTextSize(hint).x-13,end.y-28},hint,dim);
     draw->PopClipRect();
 }
@@ -2761,6 +3228,9 @@ void Editor::timeline(Animation* animation, float height) {
     ImGui::BeginDisabled(!available);
     if (ImGui::Button("|<") && available) { frame_=0; resetPlayback(); }
     ImGui::SameLine(0,4);
+    if (ImGui::Button("<") && available) stepFrame(*animation,-1);
+    labelTip("Previous frame (< or comma)");
+    ImGui::SameLine(0,4);
     if (toggleButton(playing_ ? "Pause" : "Play",playing_,{63,0}) && available) {
         if (!playing_ && !animation->loop && frame_+1 == int(animation->frames.size())) frame_=0;
         resetPlayback(!playing_);
@@ -2771,14 +3241,12 @@ void Editor::timeline(Animation* animation, float height) {
         resetPlayback(!playing_);
     }
     ImGui::SameLine(0,4);
-    if (ImGui::Button(">") && available) {
-        frame_ = (frame_+1)%int(animation->frames.size());
-        resetPlayback();
-    }
+    if (ImGui::Button(">") && available) stepFrame(*animation,1);
+    labelTip("Next frame (> or period)");
     ImGui::SameLine(0,4);
     if (ImGui::Button("Delete") && available) {
         checkpoint();
-        for (auto* cue : {&animation->projectile,&animation->item}) {
+        for (auto* cue : {&animation->subEntity,&animation->item}) {
             if (cue->frame == frame_) cue->enabled = false;
             if (cue->frame > frame_) --cue->frame;
         }
@@ -2811,6 +3279,7 @@ void Editor::timeline(Animation* animation, float height) {
         const auto start = ImGui::GetCursorScreenPos();
         const auto& frame = animation->frames[size_t(i)];
         ImGui::InvisibleButton("##Frame",{66,75});
+        if (revealFrame_ && i == frame_) ImGui::SetScrollHereX(.5f);
         if (ImGui::IsItemClicked()) { frame_ = i; resetPlayback(); }
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
             ImGui::SetDragDropPayload("FRAME_INDEX",&i,sizeof(i));
@@ -2825,7 +3294,7 @@ void Editor::timeline(Animation* animation, float height) {
                     auto& frames = animation->frames;
                     if (old < i) std::rotate(frames.begin()+old,frames.begin()+old+1,frames.begin()+i+1);
                     else std::rotate(frames.begin()+i,frames.begin()+old,frames.begin()+old+1);
-                    for (auto* cue : {&animation->projectile,&animation->item}) {
+                    for (auto* cue : {&animation->subEntity,&animation->item}) {
                         if (cue->frame == old) cue->frame = i;
                         else if (old < i && cue->frame > old && cue->frame <= i) --cue->frame;
                         else if (i < old && cue->frame >= i && cue->frame < old) ++cue->frame;
@@ -2843,13 +3312,14 @@ void Editor::timeline(Animation* animation, float height) {
         else thumbnail(draw,images_.texture(frame.image),add(start,{6,4}),{54,49});
         const auto timing = std::to_string(i)+"  ·  "+std::to_string(frame.ticks)+" cs";
         draw->AddText(add(start,{6,55}),i==frame_ ? ink : dim,timing.c_str());
-        if (animation->projectile.enabled && animation->projectile.frame == i)
+        if (animation->subEntity.enabled && animation->subEntity.frame == i)
             draw->AddCircleFilled(add(start,{56,9}),3.4f,shotColor);
         if (animation->item.enabled && animation->item.frame == i)
             draw->AddCircleFilled(add(start,{46,9}),3.4f,itemColor);
         ImGui::PopID();
     }
     ImGui::EndChild();
+    revealFrame_ = false;
 }
 
 void Editor::stageWorkspace(float left, float height) {
@@ -2874,10 +3344,13 @@ void Editor::stageWorkspace(float left, float height) {
 }
 
 void Editor::selectStageArtwork(StageSelection selection) {
+    stageCameraPreview_ = false;
     stageSelection_ = selection;
     stageArtworkDrag_.reset();
     dragSpawn_ = -1;
     placeSpawn_ = false;
+    terrainPlacement_.reset();
+    terrainDrag_.reset();
     selectStageArtworkTab_ = true;
 }
 
@@ -2901,6 +3374,9 @@ void Editor::stageLibrary() {
             placeSpawn_ = false;
             stageSelection_ = StageSelection::spawn;
             stageArtworkDrag_.reset();
+            terrainPlacement_.reset();
+            terrainDrag_.reset();
+            terrain_ = 0;
         }
         ImGui::PopID();
     }
@@ -2987,6 +3463,32 @@ void Editor::stageCanvas(Stage* stage, float height) {
         } else selectStageArtwork(stage->panels.empty() ? StageSelection::background : StageSelection::panel);
     }
     ImGui::EndDisabled();
+    if (stage) {
+        if (ImGui::GetContentRegionAvail().x > 95) ImGui::SameLine();
+        const bool terrainMode = stageSelection_ == StageSelection::terrain;
+        if (toggleButton("Terrain",terrainMode)) {
+            if (terrainMode) {
+                terrainPlacement_.reset();
+                terrainDrag_.reset();
+                stageSelection_ = StageSelection::none;
+            } else selectTerrain(terrain_);
+        }
+        if (ImGui::GetContentRegionAvail().x > 100) ImGui::SameLine();
+        if (ImGui::Button(playtest_.active() ? "Test running" : "Test Play")) showPlaytest_ = true;
+        if (ImGui::GetContentRegionAvail().x > 110) ImGui::SameLine();
+        if (toggleButton("Camera",stageCameraPreview_)) {
+            stageCameraPreview_ = !stageCameraPreview_;
+            selectStageCameraTab_ = stageCameraPreview_;
+            if (stageCameraPreview_) {
+                stageSelection_ = StageSelection::none;
+                placeSpawn_ = false;
+                stageArtworkDrag_.reset();
+                terrainDrag_.reset();
+                terrainPlacement_.reset();
+                dragSpawn_ = -1;
+            }
+        }
+    }
     ImGui::Separator();
 
     std::vector<const Texture*> panels;
@@ -3000,14 +3502,19 @@ void Editor::stageCanvas(Stage* stage, float height) {
         }
         layout = stageArtLayout(*stage,sizes);
     }
-    const int maxCamera = std::max(0,layout.width()-320);
+    const auto [screenWidth,screenHeight] = stageVideoSize(project_);
+    const int maxCamera = std::max(0,layout.width()-screenWidth);
     camera_ = std::clamp(camera_,0,maxCamera);
     ImGui::SetNextItemWidth(-142);
-    numberFields<int>("Camera X",{{camera_,0,maxCamera}},1,nullptr,true);
+    if (numberFields<int>("Preview X",{{camera_,0,maxCamera}},1,nullptr,true))
+        camera_ = std::clamp(camera_,0,maxCamera);
     ImGui::SameLine();
     if (toggleButton("Place",placeSpawn_) && stage && !stage->spawns.empty()) {
+        stageCameraPreview_ = false;
         placeSpawn_ = !placeSpawn_;
         stageArtworkDrag_.reset();
+        terrainDrag_.reset();
+        terrainPlacement_.reset();
         stageSelection_ = StageSelection::spawn;
     }
     if (stage && stage->spawns.empty()) placeSpawn_ = false;
@@ -3018,13 +3525,13 @@ void Editor::stageCanvas(Stage* stage, float height) {
     const auto end = add(start,size);
     auto& view = stageView_;
     const auto canvasOrigin = [&]() {
-        return add(start,{size.x*.5f - float(camera_+160)*view.zoom + view.pan.x,
-                          size.y*.5f - 120.0f*view.zoom + view.pan.y});
+        return add(start,{size.x*.5f - (camera_+screenWidth*.5f)*view.zoom + view.pan.x,
+                          size.y*.5f - screenHeight*.5f*view.zoom + view.pan.y});
     };
     ImGui::InvisibleButton("##Stage canvas",size,ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
     const auto& io = ImGui::GetIO();
     const bool hovered = ImGui::IsItemHovered();
-    if (hovered && io.MouseWheel != 0 && !stageArtworkDrag_)
+    if (hovered && io.MouseWheel != 0 && !stageArtworkDrag_ && !terrainDrag_)
         zoomAt(view.zoom,view.pan,io.MouseWheel,canvasOrigin(),.25f,5.0f);
     if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) view.pan = add(view.pan,io.MouseDelta);
     auto* artworkOffset = stage ? stageArtworkOffset(*stage) : nullptr;
@@ -3050,7 +3557,7 @@ void Editor::stageCanvas(Stage* stage, float height) {
         }
         if (stageSelection_ == StageSelection::panel) {
             layout = stageArtLayout(*stage,sizes);
-            camera_ = std::clamp(camera_,0,std::max(0,layout.width()-320));
+            camera_ = std::clamp(camera_,0,std::max(0,layout.width()-screenWidth));
         }
     }
     const auto origin = canvasOrigin();
@@ -3067,15 +3574,24 @@ void Editor::stageCanvas(Stage* stage, float height) {
         label(draw,add(start,{18,20}),"Add a panel image to define the stage width",dim);
     }
 
-    const int width = std::max(320,layout.width()), artHeight = std::max(240,layout.panelHeight);
+    const int width = std::max(screenWidth,layout.width()), artHeight = std::max(screenHeight,layout.panelHeight);
+    const int cameraZoom = std::clamp(stage->camera.zoom,cameraZoomMin,cameraZoomMax);
+    const int shotWidth = ((screenWidth*100/cameraZoom+3)/4)*4;
+    const int shotHeight = screenHeight*100/cameraZoom;
+    const int baseX = std::clamp(camera_+std::clamp(stage->camera.offsetX,-cameraOffsetLimit,cameraOffsetLimit),0,maxCamera);
+    const int baseY = std::clamp(stage->camera.offsetY,0,std::max(0,artHeight-screenHeight));
+    const float shotX = float(baseX-(shotWidth-screenWidth)/2);
+    const float shotY = float(baseY+screenHeight-shotHeight);
+    const auto shotStart = point(shotX,shotY);
+    const auto shotEnd = point(shotX+shotWidth,shotY+shotHeight);
     const auto artEnd = point(float(width),float(artHeight));
     draw->PushClipRect(origin,artEnd,true);
     std::optional<std::pair<ImVec2,ImVec2>> artOutline;
     if (const auto* back = images_.texture(stage->background,true)) {
         const int offsetX = std::clamp(stage->backgroundOffset.x,-stageArtworkOffsetLimit,stageArtworkOffsetLimit);
         const int offsetY = std::clamp(stage->backgroundOffset.y,-stageArtworkOffsetLimit,stageArtworkOffsetLimit);
-        const int cameraShift = stage->repeatBackgroundX ? offsetX-camera_/2 : int(offsetX-camera_*.5);
-        const float left = float(camera_+cameraShift), top = float(offsetY);
+        const int cameraShift = stage->repeatBackgroundX ? offsetX-baseX/2 : int(offsetX-baseX*.5);
+        const float left = float(baseX+cameraShift), top = float(offsetY);
         const auto a = point(left,top);
         const auto b = point(left+back->width,top+back->height);
         const ImVec2 begin{stage->repeatBackgroundX ? std::max(origin.x,start.x) : std::max(a.x,start.x),
@@ -3115,12 +3631,11 @@ void Editor::stageCanvas(Stage* stage, float height) {
     for (const int lane : {stage->laneTop,stage->laneBottom}) {
         draw->AddLine(point(0,float(lane)),point(float(width),float(lane)),(bodyColor&0xffffff)|0x8a000000);
     }
-    draw->AddRect(point(float(camera_),0),point(float(camera_+320),240),shotColor,0.0f,0,1.3f);
-    label(draw,add(point(float(camera_),240),{6,8}),"320 x 240 camera",shotColor);
+    drawStageTerrain(*stage,draw,origin,view.zoom,hovered);
     const auto spawnPoint = [&](const StageSpawn& entry) {
         return point(float(entry.at)+entry.x,float(entry.z)-entry.altitude);
     };
-    if (!artworkOffset && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (!stageCameraPreview_ && !artworkOffset && stageSelection_ != StageSelection::terrain && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         int target = -1;
         for (int i = int(stage->spawns.size())-1; i >= 0; --i) {
             if (nearMarker(io.MousePos,spawnPoint(stage->spawns[size_t(i)]),12)) { target = i; break; }
@@ -3171,6 +3686,13 @@ void Editor::stageCanvas(Stage* stage, float height) {
     }
     const auto player = point(float(stage->playerX),float(stage->playerZ));
     const auto playerColor = playerSelected ? accent : bodyColor;
+    if (stageCameraPreview_) {
+        const auto model = std::find_if(project_.characters.begin(),project_.characters.end(),[](const Character& entry) {
+            return entry.type == "player" && hasFrames(entry);
+        });
+        if (model != project_.characters.end())
+            sprite(draw,images_,*previewFrame(&*model),player,view.zoom,true);
+    }
     cross(draw,player,playerColor,playerSelected ? 8.0f : 5.0f);
     label(draw,add(player,{8,9}),"Player start",playerColor);
 
@@ -3194,18 +3716,132 @@ void Editor::stageCanvas(Stage* stage, float height) {
         }
         label(draw,add(top,{8,8}),name.c_str(),selected ? accent : ink);
     }
+    if (stageCameraPreview_) {
+        constexpr auto shade = IM_COL32(4,8,15,178);
+        const float top = std::clamp(shotStart.y,start.y,end.y);
+        const float bottom = std::clamp(shotEnd.y,start.y,end.y);
+        draw->AddRectFilled(start,{end.x,top},shade);
+        draw->AddRectFilled({start.x,bottom},end,shade);
+        draw->AddRectFilled({start.x,top},{std::clamp(shotStart.x,start.x,end.x),bottom},shade);
+        draw->AddRectFilled({std::clamp(shotEnd.x,start.x,end.x),top},{end.x,bottom},shade);
+    }
+    draw->AddRect(shotStart,shotEnd,shotColor,0.0f,0,stageCameraPreview_ ? 2.0f : 1.3f);
+    const auto cameraLabel = std::to_string(shotWidth)+" x "+std::to_string(shotHeight)+"  ·  "+std::to_string(cameraZoom)+"% camera";
+    label(draw,add({std::max(start.x,shotStart.x),std::max(start.y,shotStart.y)},{6,8}),cameraLabel.c_str(),shotColor);
     const auto scale = std::to_string(layout.width())+" px  ·  "+std::to_string(int(std::lround(view.zoom*100)))+"%";
     label(draw,{start.x+13,end.y-28},scale.c_str(),dim);
-    const char* hint = artworkOffset ? "Drag artwork  |  Arrow keys nudge" :
+    const char* hint = stageCameraPreview_ ? "Camera framing  |  Test Play to check gameplay"
+        : stageSelection_ == StageSelection::terrain
+        ? (terrainPlacement_ ? "Click to place  |  Esc to cancel" : "Drag terrain  |  Arrow keys nudge")
+        : artworkOffset ? "Drag artwork  |  Arrow keys nudge" :
         spawnSelected || playerSelected ? "Arrow keys nudge selection" : "Click a marker to select";
     label(draw,{end.x-ImGui::CalcTextSize(hint).x-13,end.y-28},hint,dim);
     draw->PopClipRect();
+}
+
+void Editor::selectTerrain(int index) {
+    stageCameraPreview_ = false;
+    terrain_ = index;
+    stageSelection_ = StageSelection::terrain;
+    stageArtworkDrag_.reset();
+    terrainDrag_.reset();
+    terrainPlacement_.reset();
+    dragSpawn_ = -1;
+    placeSpawn_ = false;
+    selectTerrainTab_ = true;
+}
+
+void Editor::drawStageTerrain(Stage& stage, ImDrawList* draw, ImVec2 origin, float zoom, bool hovered) {
+    const auto screen = [&](float x, float y) { return add(origin,{x*zoom,y*zoom}); };
+    const auto world = [&](ImVec2 position) {
+        const auto p = mul(sub(position,origin),1/zoom);
+        return ScreenPoint{int(std::lround(p.x)),int(std::lround(p.y))};
+    };
+    const bool sideView = stage.laneTop == stage.laneBottom;
+    const auto plane = [&](const StageTerrain& shape) {
+        return sideView && stage.laneTop >= shape.z-shape.depth && stage.laneTop <= shape.z ? stage.laneTop : shape.z;
+    };
+    if (stageSelection_ == StageSelection::terrain) {
+        const auto mouse = ImGui::GetIO().MousePos;
+        const bool clicked = hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+        if (terrainPlacement_ && ImGui::IsKeyPressed(ImGuiKey_Escape,false)) terrainPlacement_.reset();
+        if (terrainPlacement_ && clicked) {
+            const auto at = world(mouse);
+            StageTerrain shape;
+            shape.pit = *terrainPlacement_;
+            shape.x = std::clamp(at.x,0,stageTerrainLimit);
+            const int lane = sideView ? stage.laneTop : std::clamp(at.y,stage.laneTop,stage.laneBottom);
+            shape.z = lane+shape.depth/2;
+            shape.altitude = shape.pit ? 0 : std::clamp(lane-at.y,1,stageTerrainLimit);
+            checkpoint();
+            stage.terrain.push_back(shape);
+            selectTerrain(int(stage.terrain.size())-1);
+        } else if (clicked) {
+            for (int i = int(stage.terrain.size())-1; i >= 0; --i) {
+                const auto& shape = stage.terrain[size_t(i)];
+                const auto a = screen(float(shape.x),float(plane(shape)-shape.altitude));
+                const auto b = screen(float(shape.x+shape.width),float(plane(shape)));
+                if (mouse.x < a.x-6 || mouse.x > b.x+6 || mouse.y < a.y-7 || mouse.y > b.y+7) continue;
+                selectTerrain(i);
+                terrainDrag_ = TerrainDrag{world(mouse),shape};
+                break;
+            }
+        }
+        if (terrainDrag_ && ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::IsMousePosValid()) {
+            const auto at = world(mouse);
+            auto& drag = *terrainDrag_;
+            auto& shape = stage.terrain[size_t(terrain_)];
+            auto next = drag.original;
+            next.x = std::clamp(next.x+at.x-drag.start.x,-stageTerrainLimit,stageTerrainLimit);
+            const int dy = at.y-drag.start.y;
+            if (!next.pit) next.altitude = std::clamp(next.altitude-dy,1,stageTerrainLimit);
+            else if (!sideView) next.z = std::clamp(next.z+dy,-stageTerrainLimit,stageTerrainLimit);
+            if (next != shape) {
+                if (!drag.changed) checkpoint();
+                drag.changed = true;
+                shape = next;
+            }
+        }
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) terrainDrag_.reset();
+        if (const auto [dx,dy] = viewerNudge(!terrainPlacement_ && !terrainDrag_ && !stage.terrain.empty()); dx || dy) {
+            auto& shape = stage.terrain[size_t(terrain_)];
+            nudgePosition({shape.x,-stageTerrainLimit,stageTerrainLimit},
+                          shape.pit ? NumberField<int>{shape.z,-stageTerrainLimit,stageTerrainLimit} :
+                                      NumberField<int>{shape.altitude,1,stageTerrainLimit},
+                          dx,shape.pit ? (sideView ? 0 : dy) : -dy,[&] { checkpoint(); });
+        }
+    }
+    for (size_t i=0; i<stage.terrain.size(); ++i) {
+        const auto& shape = stage.terrain[i];
+        const float z = float(plane(shape));
+        const bool selected = stageSelection_ == StageSelection::terrain && int(i) == terrain_;
+        const auto color = selected ? accent : shape.pit ? attackColor : bodyColor;
+        const auto a = screen(float(shape.x),z-shape.altitude);
+        const auto b = screen(float(shape.x+shape.width),z);
+        if (shape.pit) {
+            draw->AddRectFilled(add(a,{0,-3}),add({b.x,a.y},{0,8}),(color&0xffffff)|0x58000000);
+            draw->AddLine(a,{b.x,a.y},color,3);
+        } else {
+            draw->AddRectFilled(a,b,(color&0xffffff)|0x32000000);
+            draw->AddRect(a,b,color);
+            draw->AddLine(a,{b.x,a.y},color,3);
+        }
+        if (!sideView && stageSelection_ == StageSelection::terrain) {
+            draw->AddRect(screen(float(shape.x),float(shape.z-shape.depth)),
+                          screen(float(shape.x+shape.width),float(shape.z)),(color&0xffffff)|0x65000000);
+        }
+        if (selected) {
+            const auto name = std::string(shape.pit ? "Pit " : "Platform ")+std::to_string(i+1);
+            label(draw,add(a,{5,-25}),name.c_str(),color);
+        }
+    }
 }
 
 void Editor::stageEvents(Stage* stage, float height) {
     (void)height;
     ImGui::BeginDisabled(!stage);
     if (filled("+ Spawn") && stage) {
+        stageCameraPreview_ = false;
         checkpoint();
         auto& entry = stage->spawns.emplace_back();
         entry.at = camera_;
@@ -3216,6 +3852,8 @@ void Editor::stageEvents(Stage* stage, float height) {
         if (entry.model.empty() && !project_.characters.empty()) entry.model = project_.characters.front().id;
         spawn_ = int(stage->spawns.size())-1;
         stageSelection_ = StageSelection::spawn;
+        terrainDrag_.reset();
+        terrainPlacement_.reset();
         placeSpawn_ = true;
     }
     ImGui::SameLine();
@@ -3234,8 +3872,11 @@ void Editor::stageEvents(Stage* stage, float height) {
         const auto entry = "AT " + std::to_string(spawn.at) + "     " + name
                          + "     (" + std::to_string(spawn.x) + ", " + std::to_string(spawn.z) + ")";
         if (ImGui::Selectable(entry.c_str(),spawn_==int(i),0,{0,24})) {
+            stageCameraPreview_ = false;
             spawn_ = int(i);
             stageSelection_ = StageSelection::spawn;
+            terrainDrag_.reset();
+            terrainPlacement_.reset();
             camera_ = spawn.at;
         }
         ImGui::PopID();
@@ -3308,6 +3949,131 @@ void Editor::stageArtworkInspector(Stage& stage) {
     }
 }
 
+void Editor::stageTerrainInspector(Stage& stage) {
+    if (project_.nativeEdits.contains(stage.nativeFile) || project_.nativeEdits.contains("data/levels.txt"))
+        ImGui::TextWrapped("Native TXT overrides take precedence on export.");
+    const bool sideView = stage.laneTop == stage.laneBottom;
+    if (!sideView && ImGui::Button("Lock to side-view lane",{-1,28})) {
+        checkpoint();
+        if (stage.backgroundDepth < 0) stage.backgroundDepth = stage.laneBottom;
+        stage.laneTop = stage.laneBottom = stage.playerZ = std::clamp(stage.playerZ,1,239);
+    }
+    if (stage.laneTop == stage.laneBottom) {
+        int lane = stage.laneTop;
+        ImGui::SetNextItemWidth(-102);
+        if (numberFields<int>("Ground Z",{{lane,1,239}})) {
+            checkpoint();
+            const int shift = std::clamp(lane,1,239)-stage.laneTop;
+            for (auto& shape : stage.terrain)
+                if (stage.laneTop >= shape.z-shape.depth && stage.laneTop <= shape.z)
+                    shape.z = std::clamp(shape.z+shift,-stageTerrainLimit,stageTerrainLimit);
+            stage.laneTop = stage.laneBottom = stage.playerZ = std::clamp(lane,1,239);
+        }
+        labelTip("Up and down movement is locked to this lane. Set a Z range in the Stage tab to restore depth movement.");
+    }
+
+    const auto place = [&](const char* name, bool pit) {
+        const bool active = terrainPlacement_ && *terrainPlacement_ == pit;
+        if (toggleButton(name,active,{-1,27})) {
+            selectTerrain(terrain_);
+            if (!active) terrainPlacement_ = pit;
+        }
+    };
+    place("+ Platform",false);
+    place("+ Pit",true);
+    if (terrainPlacement_)
+        ImGui::TextWrapped("%s",*terrainPlacement_ ? "Click where the pit begins." : "Click the left end of the platform's top.");
+    if (stage.terrain.empty()) return;
+
+    const auto name = [&](size_t i) {
+        return std::string(stage.terrain[i].pit ? "Pit " : "Platform ") + std::to_string(i+1);
+    };
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##Terrain selection",name(size_t(terrain_)).c_str())) {
+        for (size_t i=0; i<stage.terrain.size(); ++i)
+            if (ImGui::Selectable(name(i).c_str(),int(i)==terrain_)) selectTerrain(int(i));
+        ImGui::EndCombo();
+    }
+    auto next = stage.terrain[size_t(terrain_)];
+    constexpr int limit = stageTerrainLimit;
+    ImGui::TextUnformatted("X / width");
+    ImGui::SetNextItemWidth(-1);
+    bool edited = numberFields<int>("##Terrain width",{{next.x,-limit,limit},{next.width,1,limit}});
+    ImGui::TextUnformatted("Z edge / depth");
+    ImGui::SetNextItemWidth(-1);
+    edited |= numberFields<int>("##Terrain depth",{{next.z,-limit,limit},{next.depth,1,limit}});
+    ImGui::SetNextItemWidth(-102);
+    edited |= numberFields<int>(next.pit ? "Pit rim altitude" : "Top altitude",{{next.altitude,next.pit ? 0 : 1,limit}});
+    if (edited) {
+        checkpoint();
+        next.x = std::clamp(next.x,-limit,limit);
+        next.z = std::clamp(next.z,-limit,limit);
+        next.width = std::clamp(next.width,1,limit);
+        next.depth = std::clamp(next.depth,1,limit);
+        next.altitude = std::clamp(next.altitude,next.pit ? 0 : 1,limit);
+        stage.terrain[size_t(terrain_)] = next;
+        if (stageSelection_ != StageSelection::terrain) selectTerrain(terrain_);
+    }
+    if (stage.laneTop == stage.laneBottom &&
+        (stage.laneTop > next.z || stage.laneTop < next.z-next.depth))
+        ImGui::TextWrapped("This shape is outside the side-view lane.");
+    if (ImGui::Button("Center camera on selection",{-1,26}))
+        camera_ = std::max(0,next.x+next.width/2-stageVideoSize(project_).width/2);
+    if (ImGui::Button(next.pit ? "Remove pit" : "Remove platform",{-1,26})) {
+        checkpoint();
+        stage.terrain.erase(stage.terrain.begin()+terrain_);
+        selectTerrain(clampIndex(terrain_,stage.terrain.size()));
+    }
+}
+
+void Editor::stageCameraInspector(Stage& stage) {
+    auto camera = stage.camera;
+    const bool nativeText = !stage.nativeFile.empty() && project_.nativeEdits.contains(stage.nativeFile);
+    if (nativeText) textDim("This stage uses a Native TXT override.");
+    ImGui::BeginDisabled(nativeText);
+    ImGui::TextUnformatted("Game camera zoom");
+    ImGui::SetNextItemWidth(-1);
+    numberFields<int>("##Game camera zoom",{{camera.zoom,cameraZoomMin,cameraZoomMax}},1,"%d%%",true);
+    labelTip("Lower values show more of the stage. Higher values move closer.");
+    if (ImGui::Button("Wide")) camera.zoom = 75;
+    ImGui::SameLine();
+    if (ImGui::Button("Normal")) camera.zoom = 100;
+    ImGui::SameLine();
+    if (ImGui::Button("Close")) camera.zoom = 150;
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Camera offset X / Y");
+    ImGui::SetNextItemWidth(-1);
+    numberFields<int>("##Camera offset",{{camera.offsetX,-cameraOffsetLimit,cameraOffsetLimit},
+                                         {camera.offsetY,-cameraOffsetLimit,cameraOffsetLimit}});
+    labelTip("Shifts the engine's scrolling focus within the stage limits.");
+    ImGui::Checkbox("Follow jump height",&camera.followAltitude);
+    ImGui::TextUnformatted("Zoom mode");
+    ImGui::SetNextItemWidth(-1);
+    int mode = camera.nativeZoom ? 1 : 0;
+    if (ImGui::Combo("##Zoom mode",&mode,"Stock OpenBOR / 2D\0OpenBOR3D / GLB\0")) camera.nativeZoom = mode == 1;
+    if (camera.nativeZoom) textDim("Link the updated OpenBOR3D build for GLB camera zoom.");
+    else if (camera.zoom != 100) textDim("2D zoom uses a stage script. Wide views can show black edges.");
+    if (ImGui::Button("Reset camera",{-1,26})) camera = {};
+    ImGui::EndDisabled();
+    if (camera != stage.camera) {
+        camera.zoom = std::clamp(camera.zoom,cameraZoomMin,cameraZoomMax);
+        camera.offsetX = std::clamp(camera.offsetX,-cameraOffsetLimit,cameraOffsetLimit);
+        camera.offsetY = std::clamp(camera.offsetY,-cameraOffsetLimit,cameraOffsetLimit);
+    }
+    if (camera != stage.camera) {
+        checkpoint();
+        stage.camera = camera;
+        stageCameraPreview_ = true;
+        stageSelection_ = StageSelection::none;
+        placeSpawn_ = false;
+        dragSpawn_ = -1;
+        stageArtworkDrag_.reset();
+        terrainDrag_.reset();
+        terrainPlacement_.reset();
+    }
+    ImGui::Checkbox("Show camera framing",&stageCameraPreview_);
+}
+
 void Editor::stageInspector(Stage* stage) {
     section("Inspector");
     if (!stage) { textDim("Select or create a stage."); return; }
@@ -3355,6 +4121,16 @@ void Editor::stageInspector(Stage* stage) {
         ImGui::EndTabItem();
     }
     selectStageArtworkTab_ = false;
+    if (ImGui::BeginTabItem("Terrain",nullptr,selectTerrainTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
+        stageTerrainInspector(*stage);
+        ImGui::EndTabItem();
+    }
+    selectTerrainTab_ = false;
+    if (ImGui::BeginTabItem("Camera",nullptr,selectStageCameraTab_ ? ImGuiTabItemFlags_SetSelected : 0)) {
+        stageCameraInspector(*stage);
+        ImGui::EndTabItem();
+    }
+    selectStageCameraTab_ = false;
     if (ImGui::BeginTabItem("Stage")) {
         ImGui::TextUnformatted("Stage title");
         ImGui::SetNextItemWidth(-1);
@@ -3362,8 +4138,8 @@ void Editor::stageInspector(Stage* stage) {
         int lane[] = {stage->laneTop,stage->laneBottom};
         ImGui::TextUnformatted("Walkable Z range");
         ImGui::SetNextItemWidth(-1);
-        if (numberFields<int>("##Walkable lane",{{lane[0],0,239},{lane[1],stage->laneTop,239}})) {
-            stage->laneTop=std::clamp(lane[0],0,239);
+        if (numberFields<int>("##Walkable lane",{{lane[0],1,239},{lane[1],std::max(1,stage->laneTop),239}})) {
+            stage->laneTop=std::clamp(lane[0],1,239);
             stage->laneBottom=std::clamp(lane[1],stage->laneTop,239);
             stage->playerZ=std::clamp(stage->playerZ,stage->laneTop,stage->laneBottom);
             dirty_ = true;
@@ -3387,6 +4163,9 @@ void Editor::stageInspector(Stage* stage) {
             camera_ = spawn_ = panel_ = 0;
             stageSelection_ = StageSelection::none;
             stageArtworkDrag_.reset();
+            terrainDrag_.reset();
+            terrainPlacement_.reset();
+            terrain_ = 0;
         }
         ImGui::EndTabItem();
     }

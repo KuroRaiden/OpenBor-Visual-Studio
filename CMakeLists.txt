@@ -19,7 +19,7 @@ target_include_directories(imgui PUBLIC "${IMGUI_DIR}" "${IMGUI_DIR}/backends" "
 target_compile_features(imgui PUBLIC cxx_std_20)
 target_compile_definitions(imgui PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
-add_executable(OpenBORStudio WIN32 src/main.cpp src/ui.cpp src/project.cpp src/images.cpp src/module.cpp src/mesh.cpp src/media.cpp src/native.cpp)
+add_executable(OpenBORStudio WIN32 src/main.cpp src/ui.cpp src/project.cpp src/images.cpp src/module.cpp src/mesh.cpp src/media.cpp src/native.cpp src/jump.cpp src/recovery.cpp src/playtest.cpp)
 target_compile_definitions(OpenBORStudio PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(OpenBORStudio PRIVATE vendor)
 target_link_libraries(OpenBORStudio PRIVATE imgui d3d11 dxgi windowscodecs ole32 shell32 shlwapi uuid gdi32 gdiplus winmm)

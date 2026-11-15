@@ -216,6 +216,7 @@ int run(HINSTANCE instance, int show, const std::vector<std::wstring>& args) {
     studio::Editor studioEditor(hwnd,graphics.device.Get(),sample);
     editor = &studioEditor;
     if (capturing && args[2] != L"blank") editor->setCaptureView(args[2] == L"stage");
+    if (!capturing) studioEditor.initializeSession();
     ShowWindow(hwnd,capturing ? SW_SHOWNOACTIVATE : show);
     UpdateWindow(hwnd);
     bool running = true;
@@ -228,6 +229,7 @@ int run(HINSTANCE instance, int show, const std::vector<std::wstring>& args) {
             if (message.message == WM_QUIT) running = false;
         }
         if (!running) break;
+        if (!capturing) studioEditor.updateBackgroundTasks();
         if (minimized) { Sleep(25); continue; }
         if (pendingWidth && pendingHeight) {
             graphics.resize(pendingWidth,pendingHeight);
